@@ -450,6 +450,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
     ),
   ];
   String? _selectedDocumentId;
+  bool _isSearching = false;
 
   @override
   void dispose() {
@@ -472,9 +473,9 @@ class _AssistantScreenState extends State<AssistantScreen> {
       final document = await widget.documents.pickAndImportPdf();
       if (!mounted || document == null) return;
       setState(() => _selectedDocumentId = document.id);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${document.name} is ready for offline chat.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(_indexMessage(document))));
     } on DocumentStorageException catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -513,7 +514,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
                 leading: const Icon(Icons.picture_as_pdf_rounded),
                 title: Text(document.name),
                 subtitle: Text(
-                  '${_formatBytes(document.byteCount)} stored locally',
+                  '${_formatBytes(document.byteCount)} | ${_documentStatus(document)}',
                 ),
                 trailing: _selectedDocument?.id == document.id
                     ? const Icon(Icons.check_rounded)
@@ -529,21 +530,49 @@ class _AssistantScreenState extends State<AssistantScreen> {
     );
   }
 
-  void _send() {
+  Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
     final document = _selectedDocument;
     setState(() {
       _messages.add(_ChatMessage(content: text, isAssistant: false));
+      _controller.clear();
+      _isSearching = document != null;
+    });
+
+    if (document == null) {
+      setState(() {
+        _messages.add(
+          const _ChatMessage(
+            content:
+                'Choose an imported PDF to search your local documents. The on-device language model is the next integration for general answers.',
+            isAssistant: true,
+          ),
+        );
+      });
+      return;
+    }
+
+    if (document.indexState != DocumentIndexState.ready) {
+      setState(() {
+        _isSearching = false;
+        _messages.add(
+          _ChatMessage(content: _indexMessage(document), isAssistant: true),
+        );
+      });
+      return;
+    }
+
+    final hits = await widget.documents.search(document, text);
+    if (!mounted) return;
+    setState(() {
+      _isSearching = false;
       _messages.add(
         _ChatMessage(
-          content: document != null
-              ? '${document.name} is selected and stored only on this device. Local text extraction and model answers are the next integration step.'
-              : 'I am working from the local model only. Add a document if you want a source-grounded answer.',
+          content: _searchResponse(document, hits),
           isAssistant: true,
         ),
       );
-      _controller.clear();
     });
   }
 
@@ -706,8 +735,14 @@ class _AssistantScreenState extends State<AssistantScreen> {
                     ),
                     const SizedBox(width: 8),
                     IconButton.filled(
-                      onPressed: _send,
-                      icon: const Icon(Icons.arrow_upward_rounded),
+                      onPressed: _isSearching ? null : _send,
+                      icon: _isSearching
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.arrow_upward_rounded),
                     ),
                   ],
                 ),
@@ -1035,7 +1070,7 @@ class LibraryScreen extends StatelessWidget {
                   icon: Icons.picture_as_pdf_rounded,
                   title: document.name,
                   subtitle:
-                      'PDF | ${_formatBytes(document.byteCount)} | Stored offline',
+                      'PDF | ${_formatBytes(document.byteCount)} | ${_documentStatus(document)}',
                   color: const Color(0xFFC33D30),
                   onDelete: () => _deleteDocument(context, document),
                 ),
@@ -1548,6 +1583,46 @@ class _ChatMessage {
   const _ChatMessage({required this.content, required this.isAssistant});
   final String content;
   final bool isAssistant;
+}
+
+String _documentStatus(LocalDocument document) {
+  return switch (document.indexState) {
+    DocumentIndexState.pending => 'Waiting to index',
+    DocumentIndexState.indexing => 'Indexing local text',
+    DocumentIndexState.ready => 'Ready for search',
+    DocumentIndexState.needsOcr => 'OCR needed',
+    DocumentIndexState.failed => 'Could not read PDF',
+  };
+}
+
+String _indexMessage(LocalDocument document) {
+  return switch (document.indexState) {
+    DocumentIndexState.pending || DocumentIndexState.indexing =>
+      '${document.name} is indexing its local text. Try again in a moment.',
+    DocumentIndexState.ready =>
+      '${document.name} is ready for offline document search.',
+    DocumentIndexState.needsOcr =>
+      '${document.name} has no selectable text. Offline OCR is needed before resQ can search it.',
+    DocumentIndexState.failed =>
+      'resQ could not read ${document.name}. The PDF may be protected or malformed.',
+  };
+}
+
+String _searchResponse(LocalDocument document, List<DocumentSearchHit> hits) {
+  if (hits.isEmpty) {
+    return 'I could not find a matching section in ${document.name}. Try different words from the document or choose another guide.';
+  }
+
+  final results = hits
+      .map((hit) {
+        final compactText = hit.section.text.replaceAll(RegExp(r'\s+'), ' ');
+        final preview = compactText.length > 220
+            ? '${compactText.substring(0, 220)}...'
+            : compactText;
+        return 'Page ${hit.section.pageNumber}: $preview';
+      })
+      .join('\n\n');
+  return 'Found ${hits.length} relevant ${hits.length == 1 ? 'section' : 'sections'} in ${document.name}:\n\n$results';
 }
 
 String _formatBytes(int byteCount) {

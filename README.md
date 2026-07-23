@@ -10,10 +10,11 @@ internet access is unavailable or untrusted. Its first vertical slice combines:
 
 ## Current implementation
 
-PDF import is implemented. resQ copies user-selected PDFs into private app
-storage, persists their local metadata, shows them in Library, and makes them
-selectable as Assistant context. PDF text extraction, OCR, local model answers,
-and encrypted vault storage are the next integrations.
+PDF import and native-text indexing are implemented. resQ copies user-selected
+PDFs into private app storage, extracts their selectable text page by page,
+stores local search sections, and returns page-cited excerpts in Assistant.
+Scanned PDFs that contain no selectable text are marked for OCR. OCR, local
+model answers, and encrypted vault storage are the next integrations.
 
 ## Run locally
 

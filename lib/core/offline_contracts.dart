@@ -4,6 +4,8 @@
 
 enum DeliveryState { queued, nearbyDelivered, relayed, expired }
 
+enum DocumentIndexState { pending, indexing, ready, needsOcr, failed }
+
 class LocalDocument {
   const LocalDocument({
     required this.id,
@@ -12,6 +14,7 @@ class LocalDocument {
     required this.byteCount,
     required this.pageCount,
     required this.addedAt,
+    this.indexState = DocumentIndexState.pending,
   });
 
   final String id;
@@ -20,6 +23,40 @@ class LocalDocument {
   final int byteCount;
   final int pageCount;
   final DateTime addedAt;
+  final DocumentIndexState indexState;
+
+  LocalDocument copyWith({int? pageCount, DocumentIndexState? indexState}) {
+    return LocalDocument(
+      id: id,
+      name: name,
+      filePath: filePath,
+      byteCount: byteCount,
+      pageCount: pageCount ?? this.pageCount,
+      addedAt: addedAt,
+      indexState: indexState ?? this.indexState,
+    );
+  }
+}
+
+class DocumentSection {
+  const DocumentSection({
+    required this.documentId,
+    required this.pageNumber,
+    required this.sectionNumber,
+    required this.text,
+  });
+
+  final String documentId;
+  final int pageNumber;
+  final int sectionNumber;
+  final String text;
+}
+
+class DocumentSearchHit {
+  const DocumentSearchHit({required this.section, required this.score});
+
+  final DocumentSection section;
+  final int score;
 }
 
 class GroundedAnswer {
