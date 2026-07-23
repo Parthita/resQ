@@ -8,6 +8,13 @@ internet access is unavailable or untrusted. Its first vertical slice combines:
 - SOS, location sharing, and a general sensor dashboard.
 - A local library for guides, documents, notes, and captured observations.
 
+## Current implementation
+
+PDF import is implemented. resQ copies user-selected PDFs into private app
+storage, persists their local metadata, shows them in Library, and makes them
+selectable as Assistant context. PDF text extraction, OCR, local model answers,
+and encrypted vault storage are the next integrations.
+
 ## Run locally
 
 Once Flutter's Android command-line tools and licenses are configured, run the

@@ -13,7 +13,7 @@ Flutter UI
 
 ## Document assistant
 
-1. Import a PDF into encrypted local storage.
+1. Import a PDF into private local app storage.
 2. Extract text locally and OCR pages that have no text layer.
 3. Split text into page-aware chunks and store a local FTS index.
 4. Select relevant chunks for each question.
@@ -21,7 +21,8 @@ Flutter UI
 6. Return the answer with page references and a safety flag.
 
 For small PDFs, the full document may fit in the model context. Large files use
-the local section search above; the document never leaves the device.
+the local section search above; the document never leaves the device. Vault
+encryption is a later security milestone and is not yet implemented.
 
 ## Nearby messaging
 

@@ -1,6 +1,6 @@
-/// Platform and model integrations are deliberately behind these contracts.
-/// The Flutter UI can remain fully local-first while Android implementations
-/// handle BLE, Wi-Fi Direct, OCR, and the on-device model runtime.
+// Platform and model integrations are deliberately behind these contracts.
+// The Flutter UI can remain fully local-first while Android implementations
+// handle BLE, Wi-Fi Direct, OCR, and the on-device model runtime.
 
 enum DeliveryState { queued, nearbyDelivered, relayed, expired }
 
@@ -8,12 +8,16 @@ class LocalDocument {
   const LocalDocument({
     required this.id,
     required this.name,
+    required this.filePath,
+    required this.byteCount,
     required this.pageCount,
     required this.addedAt,
   });
 
   final String id;
   final String name;
+  final String filePath;
+  final int byteCount;
   final int pageCount;
   final DateTime addedAt;
 }

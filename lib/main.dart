@@ -1,11 +1,41 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+
+import 'core/document_store.dart';
+import 'core/local_document_repository.dart';
+import 'core/offline_contracts.dart';
 
 void main() {
   runApp(const ResQApp());
 }
 
-class ResQApp extends StatelessWidget {
-  const ResQApp({super.key});
+class ResQApp extends StatefulWidget {
+  const ResQApp({this.loadDocuments = true, super.key});
+
+  final bool loadDocuments;
+
+  @override
+  State<ResQApp> createState() => _ResQAppState();
+}
+
+class _ResQAppState extends State<ResQApp> {
+  late final DocumentStore _documents;
+
+  @override
+  void initState() {
+    super.initState();
+    _documents = DocumentStore();
+    if (widget.loadDocuments) {
+      unawaited(_documents.load());
+    }
+  }
+
+  @override
+  void dispose() {
+    _documents.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -50,13 +80,15 @@ class ResQApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const ResQShell(),
+      home: ResQShell(documents: _documents),
     );
   }
 }
 
 class ResQShell extends StatefulWidget {
-  const ResQShell({super.key});
+  const ResQShell({required this.documents, super.key});
+
+  final DocumentStore documents;
 
   @override
   State<ResQShell> createState() => _ResQShellState();
@@ -112,15 +144,16 @@ class _ResQShellState extends State<ResQShell> {
   Widget build(BuildContext context) {
     final pages = [
       HomeScreen(
+        documents: widget.documents,
         onAssistant: () => setState(() => _selectedIndex = 1),
         onPeople: () => setState(() => _selectedIndex = 2),
         onLibrary: () => setState(() => _selectedIndex = 3),
         onSensors: _openSensors,
         onSos: _openSos,
       ),
-      const AssistantScreen(),
+      AssistantScreen(documents: widget.documents),
       const PeopleScreen(),
-      const LibraryScreen(),
+      LibraryScreen(documents: widget.documents),
     ];
 
     return Scaffold(
@@ -158,6 +191,7 @@ class _ResQShellState extends State<ResQShell> {
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({
+    required this.documents,
     required this.onAssistant,
     required this.onPeople,
     required this.onLibrary,
@@ -166,6 +200,7 @@ class HomeScreen extends StatelessWidget {
     super.key,
   });
 
+  final DocumentStore documents;
   final VoidCallback onAssistant;
   final VoidCallback onPeople;
   final VoidCallback onLibrary;
@@ -334,34 +369,49 @@ class HomeScreen extends StatelessWidget {
                   ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
                 ),
                 const SizedBox(height: 12),
-                const Card(
-                  child: Padding(
-                    padding: EdgeInsets.all(18),
-                    child: Column(
-                      children: [
-                        InfoRow(
-                          icon: Icons.group_outlined,
-                          title: 'Weekend trek',
-                          detail: '6 members, 3 nearby',
-                          color: Color(0xFF2A5D4A),
+                AnimatedBuilder(
+                  animation: documents,
+                  builder: (context, _) {
+                    final documentCount = documents.documents.length;
+                    final documentTitle = documentCount == 0
+                        ? 'No documents yet'
+                        : '$documentCount offline ${documentCount == 1 ? 'document' : 'documents'}';
+                    final documentDetail = documents.isLoading
+                        ? 'Loading your library'
+                        : documentCount == 0
+                        ? 'Import a PDF to chat with it'
+                        : 'Ready for document chat';
+
+                    return Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(18),
+                        child: Column(
+                          children: [
+                            const InfoRow(
+                              icon: Icons.group_outlined,
+                              title: 'Weekend trek',
+                              detail: '6 members, 3 nearby',
+                              color: Color(0xFF2A5D4A),
+                            ),
+                            const Divider(height: 28),
+                            InfoRow(
+                              icon: Icons.description_outlined,
+                              title: documentTitle,
+                              detail: documentDetail,
+                              color: const Color(0xFF75613B),
+                            ),
+                            const Divider(height: 28),
+                            const InfoRow(
+                              icon: Icons.battery_5_bar_rounded,
+                              title: 'Battery 74%',
+                              detail: 'Battery saver is off',
+                              color: Color(0xFF1C6B83),
+                            ),
+                          ],
                         ),
-                        Divider(height: 28),
-                        InfoRow(
-                          icon: Icons.description_outlined,
-                          title: 'Himachal trail guide',
-                          detail: 'Ready for offline chat',
-                          color: Color(0xFF75613B),
-                        ),
-                        Divider(height: 28),
-                        InfoRow(
-                          icon: Icons.battery_5_bar_rounded,
-                          title: 'Battery 74%',
-                          detail: 'Battery saver is off',
-                          color: Color(0xFF1C6B83),
-                        ),
-                      ],
-                    ),
-                  ),
+                      ),
+                    );
+                  },
                 ),
                 const SizedBox(height: 14),
                 OutlinedButton.icon(
@@ -382,7 +432,9 @@ class HomeScreen extends StatelessWidget {
 }
 
 class AssistantScreen extends StatefulWidget {
-  const AssistantScreen({super.key});
+  const AssistantScreen({required this.documents, super.key});
+
+  final DocumentStore documents;
 
   @override
   State<AssistantScreen> createState() => _AssistantScreenState();
@@ -397,7 +449,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
       isAssistant: true,
     ),
   ];
-  bool _guideSelected = true;
+  String? _selectedDocumentId;
 
   @override
   void dispose() {
@@ -405,15 +457,88 @@ class _AssistantScreenState extends State<AssistantScreen> {
     super.dispose();
   }
 
+  LocalDocument? get _selectedDocument {
+    final documentId = _selectedDocumentId;
+    if (documentId == null) return null;
+
+    for (final document in widget.documents.documents) {
+      if (document.id == documentId) return document;
+    }
+    return null;
+  }
+
+  Future<void> _importDocument() async {
+    try {
+      final document = await widget.documents.pickAndImportPdf();
+      if (!mounted || document == null) return;
+      setState(() => _selectedDocumentId = document.id);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${document.name} is ready for offline chat.')),
+      );
+    } on DocumentStorageException catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(error.message)));
+    }
+  }
+
+  Future<void> _selectDocument() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (sheetContext) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
+          children: [
+            const Text(
+              'Choose assistant context',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 12),
+            ListTile(
+              leading: const Icon(Icons.auto_awesome_rounded),
+              title: const Text('General offline assistant'),
+              trailing: _selectedDocument == null
+                  ? const Icon(Icons.check_rounded)
+                  : null,
+              onTap: () {
+                setState(() => _selectedDocumentId = null);
+                Navigator.pop(sheetContext);
+              },
+            ),
+            for (final document in widget.documents.documents)
+              ListTile(
+                leading: const Icon(Icons.picture_as_pdf_rounded),
+                title: Text(document.name),
+                subtitle: Text(
+                  '${_formatBytes(document.byteCount)} stored locally',
+                ),
+                trailing: _selectedDocument?.id == document.id
+                    ? const Icon(Icons.check_rounded)
+                    : null,
+                onTap: () {
+                  setState(() => _selectedDocumentId = document.id);
+                  Navigator.pop(sheetContext);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _send() {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
+    final document = _selectedDocument;
     setState(() {
       _messages.add(_ChatMessage(content: text, isAssistant: false));
       _messages.add(
         _ChatMessage(
-          content: _guideSelected
-              ? 'Based on Himachal trail guide.pdf, the document describes a reliable water point before the third camp. Check the condition locally before relying on it. [p. 14]'
+          content: document != null
+              ? '${document.name} is selected and stored only on this device. Local text extraction and model answers are the next integration step.'
               : 'I am working from the local model only. Add a document if you want a source-grounded answer.',
           isAssistant: true,
         ),
@@ -424,167 +549,173 @@ class _AssistantScreenState extends State<AssistantScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
-            child: Row(
-              children: [
-                const Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Assistant',
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.w800,
-                          letterSpacing: -0.8,
-                        ),
-                      ),
-                      SizedBox(height: 3),
-                      Text(
-                        'Private. Local. Source-aware.',
-                        style: TextStyle(color: Color(0xFF68736D)),
-                      ),
-                    ],
-                  ),
-                ),
-                IconButton.filledTonal(
-                  onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text('Document picker will connect here.'),
-                    ),
-                  ),
-                  icon: const Icon(Icons.add_rounded),
-                  tooltip: 'Add a document',
-                ),
-              ],
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 20),
-            child: InkWell(
-              borderRadius: BorderRadius.circular(18),
-              onTap: () => setState(() => _guideSelected = !_guideSelected),
-              child: Ink(
-                padding: const EdgeInsets.all(14),
-                decoration: BoxDecoration(
-                  color: _guideSelected
-                      ? const Color(0xFFE2F0E4)
-                      : const Color(0xFFE8E7E0),
-                  borderRadius: BorderRadius.circular(18),
-                ),
+    return AnimatedBuilder(
+      animation: widget.documents,
+      builder: (context, _) {
+        final selectedDocument = _selectedDocument;
+        return SafeArea(
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 18, 20, 8),
                 child: Row(
                   children: [
-                    Icon(
-                      _guideSelected
-                          ? Icons.description_rounded
-                          : Icons.auto_awesome_rounded,
-                      color: const Color(0xFF2A5D4A),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        _guideSelected
-                            ? 'Using: Himachal trail guide.pdf'
-                            : 'General offline assistant',
-                        style: const TextStyle(fontWeight: FontWeight.w700),
+                    const Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Assistant',
+                            style: TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: -0.8,
+                            ),
+                          ),
+                          SizedBox(height: 3),
+                          Text(
+                            'Private. Local. Source-aware.',
+                            style: TextStyle(color: Color(0xFF68736D)),
+                          ),
+                        ],
                       ),
                     ),
-                    const Icon(Icons.expand_more_rounded),
+                    IconButton.filledTonal(
+                      onPressed: _importDocument,
+                      icon: const Icon(Icons.add_rounded),
+                      tooltip: 'Add a document',
+                    ),
                   ],
                 ),
               ),
-            ),
-          ),
-          const SizedBox(height: 12),
-          Expanded(
-            child: ListView.separated(
-              padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
-              itemCount: _messages.length + 1,
-              separatorBuilder: (_, _) => const SizedBox(height: 12),
-              itemBuilder: (context, index) {
-                if (index == 0) {
-                  return Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: [
-                      PromptChip(
-                        label: 'Summarize this guide',
-                        onTap: () => _controller.text = 'Summarize this guide',
-                      ),
-                      PromptChip(
-                        label: 'Find water sources',
-                        onTap: () => _controller.text = 'Find water sources',
-                      ),
-                      PromptChip(
-                        label: 'Explain simply',
-                        onTap: () => _controller.text =
-                            'Explain the key safety instructions simply',
-                      ),
-                    ],
-                  );
-                }
-                final message = _messages[index - 1];
-                return Align(
-                  alignment: message.isAssistant
-                      ? Alignment.centerLeft
-                      : Alignment.centerRight,
-                  child: Container(
-                    constraints: const BoxConstraints(maxWidth: 340),
-                    padding: const EdgeInsets.all(15),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(18),
+                  onTap: _selectDocument,
+                  child: Ink(
+                    padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
-                      color: message.isAssistant
-                          ? Colors.white
-                          : const Color(0xFF204F40),
-                      borderRadius: BorderRadius.circular(20).copyWith(
-                        bottomLeft: message.isAssistant
-                            ? const Radius.circular(4)
-                            : null,
-                        bottomRight: message.isAssistant
-                            ? null
-                            : const Radius.circular(4),
-                      ),
+                      color: selectedDocument != null
+                          ? const Color(0xFFE2F0E4)
+                          : const Color(0xFFE8E7E0),
+                      borderRadius: BorderRadius.circular(18),
                     ),
-                    child: Text(
-                      message.content,
-                      style: TextStyle(
-                        color: message.isAssistant
-                            ? const Color(0xFF1B2923)
-                            : Colors.white,
-                        height: 1.35,
-                      ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          selectedDocument != null
+                              ? Icons.description_rounded
+                              : Icons.auto_awesome_rounded,
+                          color: const Color(0xFF2A5D4A),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            selectedDocument != null
+                                ? 'Using: ${selectedDocument.name}'
+                                : 'General offline assistant',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        const Icon(Icons.expand_more_rounded),
+                      ],
                     ),
                   ),
-                );
-              },
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
-            decoration: const BoxDecoration(color: Color(0xFFF2F1EA)),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _controller,
-                    onSubmitted: (_) => _send(),
-                    textInputAction: TextInputAction.send,
-                    decoration: const InputDecoration(hintText: 'Ask anything'),
-                  ),
                 ),
-                const SizedBox(width: 8),
-                IconButton.filled(
-                  onPressed: _send,
-                  icon: const Icon(Icons.arrow_upward_rounded),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: ListView.separated(
+                  padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+                  itemCount: _messages.length + 1,
+                  separatorBuilder: (_, _) => const SizedBox(height: 12),
+                  itemBuilder: (context, index) {
+                    if (index == 0) {
+                      return Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          PromptChip(
+                            label: 'Summarize this guide',
+                            onTap: () =>
+                                _controller.text = 'Summarize this guide',
+                          ),
+                          PromptChip(
+                            label: 'Find water sources',
+                            onTap: () =>
+                                _controller.text = 'Find water sources',
+                          ),
+                          PromptChip(
+                            label: 'Explain simply',
+                            onTap: () => _controller.text =
+                                'Explain the key safety instructions simply',
+                          ),
+                        ],
+                      );
+                    }
+                    final message = _messages[index - 1];
+                    return Align(
+                      alignment: message.isAssistant
+                          ? Alignment.centerLeft
+                          : Alignment.centerRight,
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 340),
+                        padding: const EdgeInsets.all(15),
+                        decoration: BoxDecoration(
+                          color: message.isAssistant
+                              ? Colors.white
+                              : const Color(0xFF204F40),
+                          borderRadius: BorderRadius.circular(20).copyWith(
+                            bottomLeft: message.isAssistant
+                                ? const Radius.circular(4)
+                                : null,
+                            bottomRight: message.isAssistant
+                                ? null
+                                : const Radius.circular(4),
+                          ),
+                        ),
+                        child: Text(
+                          message.content,
+                          style: TextStyle(
+                            color: message.isAssistant
+                                ? const Color(0xFF1B2923)
+                                : Colors.white,
+                            height: 1.35,
+                          ),
+                        ),
+                      ),
+                    );
+                  },
                 ),
-              ],
-            ),
+              ),
+              Container(
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+                decoration: const BoxDecoration(color: Color(0xFFF2F1EA)),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _controller,
+                        onSubmitted: (_) => _send(),
+                        textInputAction: TextInputAction.send,
+                        decoration: const InputDecoration(
+                          hintText: 'Ask anything',
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton.filled(
+                      onPressed: _send,
+                      icon: const Icon(Icons.arrow_upward_rounded),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -768,109 +899,173 @@ class PeopleScreen extends StatelessWidget {
 }
 
 class LibraryScreen extends StatelessWidget {
-  const LibraryScreen({super.key});
+  const LibraryScreen({required this.documents, super.key});
+
+  final DocumentStore documents;
+
+  Future<void> _importDocument(BuildContext context) async {
+    try {
+      final document = await documents.pickAndImportPdf();
+      if (context.mounted && document != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('${document.name} saved for offline use.')),
+        );
+      }
+    } on DocumentStorageException catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    }
+  }
+
+  Future<void> _deleteDocument(
+    BuildContext context,
+    LocalDocument document,
+  ) async {
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Remove this document?'),
+        content: Text(
+          '${document.name} will be deleted from this device. This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (shouldDelete != true) return;
+
+    await documents.delete(document);
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${document.name} removed from this device.')),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    return SafeArea(
-      child: ListView(
-        padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
-        children: [
-          Row(
-            children: [
-              const Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Library',
+    return AnimatedBuilder(
+      animation: documents,
+      builder: (context, _) => SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Library',
+                        style: TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: -0.8,
+                        ),
+                      ),
+                      SizedBox(height: 3),
+                      Text(
+                        'Everything stays on this device',
+                        style: TextStyle(color: Color(0xFF68736D)),
+                      ),
+                    ],
+                  ),
+                ),
+                IconButton.filledTonal(
+                  onPressed: () => _importDocument(context),
+                  icon: const Icon(Icons.add_rounded),
+                  tooltip: 'Import a PDF',
+                ),
+              ],
+            ),
+            const SizedBox(height: 24),
+            Container(
+              padding: const EdgeInsets.all(18),
+              decoration: BoxDecoration(
+                color: const Color(0xFFE8E4D3),
+                borderRadius: BorderRadius.circular(22),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.lock_outline_rounded, color: Color(0xFF75613B)),
+                  SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      'Imported PDFs are copied into private app storage.',
                       style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: -0.8,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF5D4D2E),
                       ),
                     ),
-                    SizedBox(height: 3),
-                    Text(
-                      'Everything stays on this device',
-                      style: TextStyle(color: Color(0xFF68736D)),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 28),
+            SectionTitle(
+              title: 'Documents',
+              action: documents.isLoading ? null : 'Import PDF',
+              onAction: () => _importDocument(context),
+            ),
+            const SizedBox(height: 10),
+            if (documents.isLoading)
+              const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(28),
+                  child: CircularProgressIndicator(),
+                ),
+              )
+            else if (documents.documents.isEmpty)
+              EmptyDocumentState(onImport: () => _importDocument(context))
+            else
+              for (final document in documents.documents) ...[
+                LibraryItem(
+                  icon: Icons.picture_as_pdf_rounded,
+                  title: document.name,
+                  subtitle:
+                      'PDF | ${_formatBytes(document.byteCount)} | Stored offline',
+                  color: const Color(0xFFC33D30),
+                  onDelete: () => _deleteDocument(context, document),
+                ),
+                const SizedBox(height: 10),
+              ],
+            const SizedBox(height: 28),
+            const SectionTitle(title: 'Observations'),
+            const SizedBox(height: 10),
+            const Card(
+              child: Padding(
+                padding: EdgeInsets.all(18),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.photo_camera_back_outlined,
+                      color: Color(0xFF75613B),
+                    ),
+                    SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Photos, OCR, and saved observations will appear here.',
+                        style: TextStyle(color: Color(0xFF68736D)),
+                      ),
                     ),
                   ],
                 ),
               ),
-              IconButton.filledTonal(
-                onPressed: () => ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Choose a PDF, photo, or note to add.'),
-                  ),
-                ),
-                icon: const Icon(Icons.add_rounded),
-              ),
-            ],
-          ),
-          const SizedBox(height: 24),
-          Container(
-            padding: const EdgeInsets.all(18),
-            decoration: BoxDecoration(
-              color: const Color(0xFFE8E4D3),
-              borderRadius: BorderRadius.circular(22),
             ),
-            child: const Row(
-              children: [
-                Icon(Icons.lock_outline_rounded, color: Color(0xFF75613B)),
-                SizedBox(width: 12),
-                Expanded(
-                  child: Text(
-                    'Your library is designed for local encrypted storage.',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      color: Color(0xFF5D4D2E),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 28),
-          const SectionTitle(title: 'Documents'),
-          const SizedBox(height: 10),
-          const LibraryItem(
-            icon: Icons.picture_as_pdf_rounded,
-            title: 'Himachal trail guide',
-            subtitle: 'PDF | 2.8 MB | Ready to chat',
-            color: Color(0xFFC33D30),
-          ),
-          const SizedBox(height: 10),
-          const LibraryItem(
-            icon: Icons.menu_book_rounded,
-            title: 'First aid field notes',
-            subtitle: 'Guide | Saved for offline use',
-            color: Color(0xFF2A5D4A),
-          ),
-          const SizedBox(height: 10),
-          const LibraryItem(
-            icon: Icons.article_outlined,
-            title: 'Community rights reference',
-            subtitle: 'PDF | Added yesterday',
-            color: Color(0xFF1C6B83),
-          ),
-          const SizedBox(height: 28),
-          const SectionTitle(title: 'Observations'),
-          const SizedBox(height: 10),
-          const LibraryItem(
-            icon: Icons.image_search_rounded,
-            title: 'Food label - camp store',
-            subtitle: 'Photo summary | Today, 09:42',
-            color: Color(0xFF75613B),
-          ),
-          const SizedBox(height: 10),
-          const LibraryItem(
-            icon: Icons.edit_note_rounded,
-            title: 'Meeting point notes',
-            subtitle: 'Note | Shared with Weekend trek',
-            color: Color(0xFF5E4B7A),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -1207,9 +1402,15 @@ class NearbyDevice extends StatelessWidget {
 }
 
 class SectionTitle extends StatelessWidget {
-  const SectionTitle({required this.title, this.action, super.key});
+  const SectionTitle({
+    required this.title,
+    this.action,
+    this.onAction,
+    super.key,
+  });
   final String title;
   final String? action;
+  final VoidCallback? onAction;
   @override
   Widget build(BuildContext context) => Row(
     children: [
@@ -1221,7 +1422,8 @@ class SectionTitle extends StatelessWidget {
           ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
         ),
       ),
-      if (action != null) TextButton(onPressed: () {}, child: Text(action!)),
+      if (action != null)
+        TextButton(onPressed: onAction ?? () {}, child: Text(action!)),
     ],
   );
 }
@@ -1232,12 +1434,14 @@ class LibraryItem extends StatelessWidget {
     required this.title,
     required this.subtitle,
     required this.color,
+    this.onDelete,
     super.key,
   });
   final IconData icon;
   final String title;
   final String subtitle;
   final Color color;
+  final VoidCallback? onDelete;
   @override
   Widget build(BuildContext context) => Card(
     child: ListTile(
@@ -1253,9 +1457,57 @@ class LibraryItem extends StatelessWidget {
       ),
       title: Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
       subtitle: Text(subtitle),
-      trailing: const Icon(Icons.more_horiz_rounded),
+      trailing: onDelete == null
+          ? const Icon(Icons.more_horiz_rounded)
+          : IconButton(
+              onPressed: onDelete,
+              icon: const Icon(Icons.delete_outline_rounded),
+              tooltip: 'Remove document',
+            ),
     ),
   );
+}
+
+class EmptyDocumentState extends StatelessWidget {
+  const EmptyDocumentState({required this.onImport, super.key});
+
+  final VoidCallback onImport;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      color: const Color(0xFFE2F0E4),
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Icon(
+              Icons.picture_as_pdf_outlined,
+              color: Color(0xFF2A5D4A),
+              size: 30,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Bring your own local knowledge.',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Import a PDF. resQ copies it into private app storage and keeps it available offline.',
+              style: TextStyle(color: Color(0xFF466253), height: 1.35),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              onPressed: onImport,
+              icon: const Icon(Icons.add_rounded),
+              label: const Text('Import PDF'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class SensorMetric extends StatelessWidget {
@@ -1296,4 +1548,17 @@ class _ChatMessage {
   const _ChatMessage({required this.content, required this.isAssistant});
   final String content;
   final bool isAssistant;
+}
+
+String _formatBytes(int byteCount) {
+  const bytesInKilobyte = 1024;
+  const bytesInMegabyte = bytesInKilobyte * 1024;
+
+  if (byteCount >= bytesInMegabyte) {
+    return '${(byteCount / bytesInMegabyte).toStringAsFixed(1)} MB';
+  }
+  if (byteCount >= bytesInKilobyte) {
+    return '${(byteCount / bytesInKilobyte).toStringAsFixed(1)} KB';
+  }
+  return '$byteCount B';
 }
