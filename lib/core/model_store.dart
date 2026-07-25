@@ -12,25 +12,47 @@ class ModelStore extends ChangeNotifier {
 
   LocalModelStatus get status => _status;
   bool get isBusy => _isBusy;
-  // A persisted model can be loaded by the native layer on the first prompt.
-  bool get isReady => _status.hasModel;
+  bool get hasModel => _status.hasModel;
+  bool get isLoaded => _status.isLoaded;
+  bool get isReady => _status.isLoaded;
 
   Future<void> refresh() async {
     _status = await _service.status();
     notifyListeners();
   }
 
-  Future<void> importAndLoad() async {
+  Future<bool> import() async {
     _isBusy = true;
     notifyListeners();
     try {
       final importedStatus = await _service.pickAndImportModel();
-      if (importedStatus == null) return;
+      if (importedStatus == null) return false;
+      _status = importedStatus;
+      return true;
+    } finally {
+      _isBusy = false;
+      notifyListeners();
+    }
+  }
+
+  Future<void> load() async {
+    _isBusy = true;
+    notifyListeners();
+    try {
       _status = await _service.loadModel();
     } finally {
       _isBusy = false;
       notifyListeners();
     }
+  }
+
+  Future<void> importAndLoad() async {
+    if (!await import()) return;
+    await load();
+  }
+
+  void stopGeneration() {
+    _service.stopGeneration();
   }
 
   Stream<String> generate({required String prompt, int maxTokens = 256}) {

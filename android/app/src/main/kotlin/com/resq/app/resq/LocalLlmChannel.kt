@@ -34,6 +34,7 @@ class LocalLlmChannel(
             "loadModel" -> loadModel(result)
             "generate" -> generate(call, result)
             "unloadModel" -> unloadModel(result)
+            "stopGeneration" -> stopGeneration(result)
             else -> result.notImplemented()
         }
     }
@@ -59,6 +60,17 @@ class LocalLlmChannel(
                 val destination = File(directory, "active-model.gguf")
                 withContext(Dispatchers.IO) { source.copyTo(destination, overwrite = true) }
                 loadedModelPath = null
+
+                // Delete the cache copy from the file picker to avoid accumulation
+                withContext(Dispatchers.IO) {
+                    source.delete()
+                    // Also sweep any other stale imports from previous sessions
+                    File(context.cacheDir, "imports")
+                        .takeIf { it.isDirectory }
+                        ?.listFiles()
+                        ?.forEach { it.delete() }
+                }
+
                 result.success(modelStatus())
             } catch (error: Exception) {
                 Log.e(TAG, "GGUF import failed", error)
@@ -74,10 +86,17 @@ class LocalLlmChannel(
                 val engine = awaitEngine()
 
                 if (loadedModelPath != model.absolutePath) {
-                    if (engine.state.value.isModelLoaded) engine.cleanUp()
+                    Log.i(TAG, "LOAD: fresh load — model not in memory yet")
+                    if (engine.state.value.isModelLoaded) {
+                        Log.i(TAG, "LOAD: unloading previous model first")
+                        engine.cleanUp()
+                    }
                     engine.loadModel(model.absolutePath)
                     engine.setSystemPrompt(systemPrompt)
                     loadedModelPath = model.absolutePath
+                    Log.i(TAG, "LOAD: model ready")
+                } else {
+                    Log.i(TAG, "LOAD: skipped — model already loaded at %s".format(model.absolutePath))
                 }
                 result.success(modelStatus())
             } catch (error: Exception) {
@@ -100,12 +119,33 @@ class LocalLlmChannel(
         }
 
         generationJob = scope.launch {
+            val tStart = System.nanoTime()
+            var tLoadEnd = tStart
             try {
                 loadIfNeeded()
+                tLoadEnd = System.nanoTime()
                 val engine = awaitEngine()
+                val tGenStart = System.nanoTime()
+                var tokenCount = 0
+                var firstTokenTime = tGenStart
+
                 engine.sendUserPrompt(prompt, maxTokens).collect { token ->
+                    if (tokenCount == 0) firstTokenTime = System.nanoTime()
+                    tokenCount++
                     channel.invokeMethod("token", mapOf("value" to token))
                 }
+                val tEnd = System.nanoTime()
+
+                val setupMs = (tLoadEnd - tStart) / 1_000_000
+                val ttftMs = (firstTokenTime - tGenStart) / 1_000_000
+                val totalMs = (tEnd - tGenStart) / 1_000_000
+                val tps = if (totalMs > 0) (tokenCount * 1000.0 / totalMs) else 0.0
+
+                Log.i(TAG, "PERF: setup=%dms | ttft=%dms | tokens=%d | total=%dms | %.1f tok/s"
+                    .format(setupMs, ttftMs, tokenCount, totalMs, tps))
+                Log.i(TAG, "PERF: model was %salready loaded"
+                    .format(if (loadedModelPath != null) "" else "NOT "))
+
                 channel.invokeMethod("generationComplete", null)
                 result.success(null)
             } catch (error: Exception) {
@@ -131,15 +171,35 @@ class LocalLlmChannel(
         }
     }
 
+    private fun stopGeneration(result: MethodChannel.Result) {
+        generationJob?.cancel()
+        generationJob = null
+        scope.launch {
+            try {
+                val engine = awaitEngine()
+                engine.abortGeneration()
+            } catch (_: Exception) { }
+        }
+        result.success(null)
+    }
+
     private suspend fun loadIfNeeded() {
         val model = activeModel() ?: error("No GGUF model has been imported.")
-        if (loadedModelPath == model.absolutePath) return
+        if (loadedModelPath == model.absolutePath) {
+            Log.i(TAG, "LOADIFNEEDED: context reused — model already loaded, skipping init")
+            return
+        }
 
+        Log.i(TAG, "LOADIFNEEDED: model not loaded — performing full init (load + system prompt)")
         val engine = awaitEngine()
-        if (engine.state.value.isModelLoaded) engine.cleanUp()
+        if (engine.state.value.isModelLoaded) {
+            Log.i(TAG, "LOADIFNEEDED: unloading stale model before loading new one")
+            engine.cleanUp()
+        }
         engine.loadModel(model.absolutePath)
         engine.setSystemPrompt(systemPrompt)
         loadedModelPath = model.absolutePath
+        Log.i(TAG, "LOADIFNEEDED: model init complete")
     }
 
     private suspend fun awaitEngine(): InferenceEngine {
@@ -176,11 +236,6 @@ class LocalLlmChannel(
                 this is InferenceEngine.State.ProcessingUserPrompt ||
                 this is InferenceEngine.State.ProcessingSystemPrompt
 
-        private const val systemPrompt = """
-You are resQ, an offline emergency and document assistant.
-When retrieved document context is provided, answer only from that context.
-Keep answers concise, preserve page citations, and say when the context is insufficient.
-Do not invent medical, legal, or safety facts.
-"""
+        private const val systemPrompt = "You are resQ. Answer in 2-3 words minimum, max 2 sentences. Stay in that range unless the user asks for more. When context is given, answer only from it."
     }
 }

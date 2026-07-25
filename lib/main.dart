@@ -451,7 +451,8 @@ class AssistantScreen extends StatefulWidget {
   State<AssistantScreen> createState() => _AssistantScreenState();
 }
 
-class _AssistantScreenState extends State<AssistantScreen> {
+class _AssistantScreenState extends State<AssistantScreen>
+    with SingleTickerProviderStateMixin {
   final _controller = TextEditingController();
   final List<_ChatMessage> _messages = [
     const _ChatMessage(
@@ -462,11 +463,55 @@ class _AssistantScreenState extends State<AssistantScreen> {
   ];
   String? _selectedDocumentId;
   bool _isGenerating = false;
+  late final AnimationController _thinkingAnimation;
+
+  @override
+  void initState() {
+    super.initState();
+    _thinkingAnimation = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat();
+  }
 
   @override
   void dispose() {
+    _thinkingAnimation.dispose();
     _controller.dispose();
     super.dispose();
+  }
+
+  bool get _isThinking =>
+      _isGenerating && _messages.isNotEmpty && _messages.last.isAssistant;
+
+  Future<void> _toggleModel() async {
+    if (widget.model.isLoaded) {
+      try {
+        await widget.model.unload();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Model unloaded from memory.')),
+        );
+      } catch (error) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to unload model: $error')),
+        );
+      }
+    } else if (widget.model.hasModel) {
+      try {
+        await widget.model.load();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Model loaded and ready.')),
+        );
+      } catch (error) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to load model: $error')),
+        );
+      }
+    }
   }
 
   LocalDocument? get _selectedDocument {
@@ -551,13 +596,27 @@ class _AssistantScreenState extends State<AssistantScreen> {
       _isGenerating = true;
     });
 
-    if (!widget.model.isReady) {
+    if (!widget.model.hasModel) {
       setState(() {
         _isGenerating = false;
         _messages.add(
           const _ChatMessage(
             content:
                 'Import a GGUF model from Library before asking the offline assistant.',
+            isAssistant: true,
+          ),
+        );
+      });
+      return;
+    }
+
+    if (!widget.model.isLoaded) {
+      setState(() {
+        _isGenerating = false;
+        _messages.add(
+          const _ChatMessage(
+            content:
+                'Tap the model chip above to load the local model first.',
             isAssistant: true,
           ),
         );
@@ -700,6 +759,63 @@ class _AssistantScreenState extends State<AssistantScreen> {
                   ),
                 ),
               ),
+              const SizedBox(height: 20),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(18),
+                  onTap: _toggleModel,
+                  child: Ink(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: widget.model.isBusy
+                          ? const Color(0xFFE8E7E0)
+                          : widget.model.isLoaded
+                          ? const Color(0xFFDFF0E0)
+                          : widget.model.hasModel
+                          ? const Color(0xFFFFF3D6)
+                          : const Color(0xFFE8E7E0),
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          widget.model.isLoaded
+                              ? Icons.memory_rounded
+                              : widget.model.hasModel
+                              ? Icons.memory_outlined
+                              : Icons.auto_awesome_outlined,
+                          color: widget.model.isLoaded
+                              ? const Color(0xFF2A5D4A)
+                              : const Color(0xFF75613B),
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            widget.model.isBusy
+                                ? 'Loading model…'
+                                : widget.model.isLoaded
+                                ? 'Model loaded — tap to unload'
+                                : widget.model.hasModel
+                                ? 'Model stored — tap to load'
+                                : 'No local model imported',
+                            style: const TextStyle(fontWeight: FontWeight.w700),
+                          ),
+                        ),
+                        if (widget.model.hasModel)
+                          Icon(
+                            widget.model.isLoaded
+                                ? Icons.power_settings_new_rounded
+                                : Icons.play_arrow_rounded,
+                            color: widget.model.isLoaded
+                                ? const Color(0xFF2A5D4A)
+                                : const Color(0xFF75613B),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
               const SizedBox(height: 12),
               Expanded(
                 child: ListView.separated(
@@ -731,6 +847,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
                       );
                     }
                     final message = _messages[index - 1];
+                    final isThinking = _isThinking && index - 1 == _messages.length - 1;
                     return Align(
                       alignment: message.isAssistant
                           ? Alignment.centerLeft
@@ -751,15 +868,17 @@ class _AssistantScreenState extends State<AssistantScreen> {
                                 : const Radius.circular(4),
                           ),
                         ),
-                        child: Text(
-                          message.content,
-                          style: TextStyle(
-                            color: message.isAssistant
-                                ? const Color(0xFF1B2923)
-                                : Colors.white,
-                            height: 1.35,
-                          ),
-                        ),
+                        child: isThinking
+                            ? _ThinkingDots(animation: _thinkingAnimation)
+                            : Text(
+                                message.content,
+                                style: TextStyle(
+                                  color: message.isAssistant
+                                      ? const Color(0xFF1B2923)
+                                      : Colors.white,
+                                  height: 1.35,
+                                ),
+                              ),
                       ),
                     );
                   },
@@ -781,16 +900,22 @@ class _AssistantScreenState extends State<AssistantScreen> {
                       ),
                     ),
                     const SizedBox(width: 8),
-                    IconButton.filled(
-                      onPressed: _isGenerating ? null : _send,
-                      icon: _isGenerating
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.arrow_upward_rounded),
-                    ),
+                    _isGenerating
+                        ? IconButton.filledTonal(
+                            onPressed: () {
+                              widget.model.stopGeneration();
+                              setState(() => _isGenerating = false);
+                            },
+                            icon: const Icon(Icons.stop_rounded),
+                            style: IconButton.styleFrom(
+                              backgroundColor: const Color(0xFFFFE0DF),
+                              foregroundColor: const Color(0xFFC33D30),
+                            ),
+                          )
+                        : IconButton.filled(
+                            onPressed: _send,
+                            icon: const Icon(Icons.arrow_upward_rounded),
+                          ),
                   ],
                 ),
               ),
@@ -1130,14 +1255,13 @@ class LibraryScreen extends StatelessWidget {
 
   Future<void> _importModel(BuildContext context) async {
     try {
-      await model.importAndLoad();
+      final imported = await model.import();
       if (!context.mounted) return;
-      final status = model.status;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            status.isLoaded
-                ? 'Local model loaded. Assistant answers now run on this phone.'
+            imported
+                ? 'Model imported. Go to Assistant to load it.'
                 : 'Model import was cancelled.',
           ),
         ),
@@ -1145,7 +1269,7 @@ class LibraryScreen extends StatelessWidget {
     } catch (error) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not load local model: $error')),
+          SnackBar(content: Text('Could not import model: $error')),
         );
       }
     }
@@ -1284,12 +1408,18 @@ class LibraryScreen extends StatelessWidget {
                       width: 46,
                       height: 46,
                       decoration: BoxDecoration(
-                        color: const Color(0xFFE2F0E4),
+                        color: model.isLoaded
+                            ? const Color(0xFFE2F0E4)
+                            : const Color(0xFFE8E7E0),
                         borderRadius: BorderRadius.circular(15),
                       ),
-                      child: const Icon(
-                        Icons.memory_rounded,
-                        color: Color(0xFF2A5D4A),
+                      child: Icon(
+                        model.isLoaded
+                            ? Icons.memory_rounded
+                            : Icons.memory_outlined,
+                        color: model.isLoaded
+                            ? const Color(0xFF2A5D4A)
+                            : const Color(0xFF68736D),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -1298,17 +1428,19 @@ class LibraryScreen extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            model.isReady
-                                ? 'GGUF model loaded'
-                                : 'No GGUF model loaded',
+                            model.isLoaded
+                                ? 'Model loaded in memory'
+                                : model.hasModel
+                                ? 'Model stored (not loaded)'
+                                : 'No GGUF model imported',
                             style: const TextStyle(fontWeight: FontWeight.w800),
                           ),
                           const SizedBox(height: 2),
                           Text(
                             model.isBusy
-                                ? 'Copying and preparing the model'
-                                : model.status.hasModel
-                                ? '${_formatBytes(model.status.sizeBytes)} stored privately'
+                                ? 'Working…'
+                                : model.hasModel
+                                ? '${_formatBytes(model.status.sizeBytes)} • ${model.isLoaded ? 'loaded' : 'tap load in Assistant'}'
                                 : 'Import a small quantized GGUF model',
                             style: const TextStyle(
                               color: Color(0xFF68736D),
@@ -1322,7 +1454,7 @@ class LibraryScreen extends StatelessWidget {
                       onPressed: model.isBusy
                           ? null
                           : () => _importModel(context),
-                      child: Text(model.status.hasModel ? 'Replace' : 'Import'),
+                      child: Text(model.hasModel ? 'Replace' : 'Import'),
                     ),
                   ],
                 ),
@@ -1640,6 +1772,31 @@ class InfoRow extends StatelessWidget {
       const Icon(Icons.chevron_right_rounded, color: Color(0xFF89918C)),
     ],
   );
+}
+
+class _ThinkingDots extends StatelessWidget {
+  const _ThinkingDots({required this.animation});
+
+  final Animation<double> animation;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: animation,
+      builder: (context, _) {
+        final phase = (animation.value * 3).floor();
+        return Text(
+          phase == 0 ? '.' : phase == 1 ? '..' : '...',
+          style: const TextStyle(
+            color: Color(0xFF68736D),
+            fontSize: 28,
+            height: 0.6,
+            letterSpacing: 2,
+          ),
+        );
+      },
+    );
+  }
 }
 
 class PromptChip extends StatelessWidget {

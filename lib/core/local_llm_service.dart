@@ -86,6 +86,14 @@ class LocalLlmService {
     return controller.stream;
   }
 
+  Future<void> stopGeneration() async {
+    try {
+      await _channel.invokeMethod<void>('stopGeneration');
+    } finally {
+      _closeGeneration();
+    }
+  }
+
   Future<void> unloadModel() async {
     await _channel.invokeMethod<void>('unloadModel');
   }
