@@ -207,7 +207,10 @@ class MeshController {
       id: p.id,
       // Connection-state callbacks do not include an advertisement name; do
       // not overwrite the useful discovery name with a random BLE UUID.
-      nickname: p.name ?? previous?.nickname ?? p.id,
+      // Android may surface an inbound connection with a rotating MAC/UUID
+      // and no advertisement name. That is transport metadata, never a
+      // user-facing identity; wait for the signed BitChat announce instead.
+      nickname: p.name ?? previous?.nickname ?? 'Nearby resQ',
       identityHint: p.identityHint ?? previous?.identityHint,
       lastSeen: DateTime.now(),
       connected: p.connected,

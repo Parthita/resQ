@@ -1026,14 +1026,13 @@ class _PeopleScreenState extends State<PeopleScreen> {
             initialData: _mesh.contacts,
             builder: (context, snapshot) {
               final contacts = snapshot.data ?? const [];
-              final identified = contacts.map((contact) => contact.id).toSet();
-              final rawPeers = _peerList
-                  .where(
-                    (peer) =>
-                        peer.identityHint == null ||
-                        !identified.contains(peer.identityHint),
-                  )
-                  .toList();
+              // Android can surface several rotating BLE addresses for the
+              // same phone (scan address, inbound central, outbound GATT).
+              // A verified BitChat sender id is the stable person identity,
+              // so raw transport aliases are only shown before verification.
+              final rawPeers = contacts.isEmpty
+                  ? _peerList
+                  : const <MeshPeer>[];
               if (contacts.isNotEmpty || rawPeers.isNotEmpty) {
                 return Column(
                   children: [
