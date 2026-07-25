@@ -7,6 +7,9 @@ import 'core/local_document_repository.dart';
 import 'core/local_llm_service.dart';
 import 'core/model_store.dart';
 import 'core/offline_contracts.dart';
+import 'core/bitchat/ble_link.dart';
+import 'mesh_chat_screen.dart';
+import 'mesh_controller.dart';
 
 void main() {
   runApp(const ResQApp());
@@ -257,7 +260,7 @@ class HomeScreen extends StatelessWidget {
                         ],
                       ),
                     ),
-                    const StatusPill(
+                    StatusPill(
                       label: 'OFFLINE',
                       icon: Icons.cloud_off_rounded,
                     ),
@@ -802,7 +805,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
   }
 }
 
-class PeopleScreen extends StatelessWidget {
+class PeopleScreen extends StatefulWidget {
   const PeopleScreen({super.key});
 
   void _showPairing(BuildContext context, String device) {
@@ -841,12 +844,90 @@ class PeopleScreen extends StatelessWidget {
   }
 
   @override
+  State<PeopleScreen> createState() => _PeopleScreenState();
+}
+
+class _PeopleScreenState extends State<PeopleScreen> {
+  final MeshController _mesh = MeshController();
+  MeshState _state = MeshState.stopped;
+  String _statusText = 'Mesh is off';
+  bool _permDenied = false;
+  bool _btOff = false;
+  List<MeshPeer> _peerList = const [];
+
+  @override
+  void initState() {
+    super.initState();
+    _mesh.stateStream.listen((s) {
+      if (!mounted) return;
+      setState(() {
+        _state = s;
+        _statusText = switch (s) {
+          MeshState.stopped => 'Mesh is off',
+          MeshState.starting => 'Starting Bluetooth mesh…',
+          MeshState.running => 'Mesh active — discovering peers',
+          MeshState.stopping => 'Stopping mesh…',
+        };
+      });
+    });
+    _mesh.peersStream.listen((peers) {
+      if (!mounted) return;
+      setState(() => _peerList = peers);
+    });
+  }
+
+  Future<void> _toggleMesh() async {
+    if (_state == MeshState.running || _state == MeshState.starting) {
+      await _mesh.stop();
+      return;
+    }
+    // 1) runtime permission + adapter check (the half the manifest alone can't do)
+    final result = await _mesh.requestPermissions();
+    if (!mounted) return;
+    if (!result.ok) {
+      setState(() {
+        _permDenied = result.reason == 'permissions';
+        _btOff = result.reason == 'bluetooth_off';
+      });
+      return;
+    }
+    setState(() {
+      _permDenied = false;
+      _btOff = false;
+    });
+    // 2) start BLE + flood router + CRDT tunnel
+    try {
+      await _mesh.start();
+    } on BluetoothOffException {
+      if (!mounted) return;
+      setState(() => _btOff = true);
+      return;
+    }
+    // 3) publish our presence as a CRDT note so the peer mesh converges
+    final myHex = _mesh.identity.senderId
+        .map((e) => e.toRadixString(16).padLeft(2, '0'))
+        .join();
+    await _mesh.tunnel.setPresence(myHex, 'resQ');
+    await _mesh.publishNote('peer:$myHex\n');
+  }
+
+  @override
+  void dispose() {
+    _mesh.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final isOn = _state == MeshState.running;
+    final statusLabel = isOn ? 'VISIBLE' : 'OFFLINE';
+    final statusIcon =
+        isOn ? Icons.visibility_outlined : Icons.visibility_off_outlined;
     return SafeArea(
       child: ListView(
         padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
         children: [
-          const Row(
+          Row(
             children: [
               Expanded(
                 child: Column(
@@ -868,12 +949,15 @@ class PeopleScreen extends StatelessWidget {
                   ],
                 ),
               ),
-              StatusPill(label: 'VISIBLE', icon: Icons.visibility_outlined),
+              StatusPill(
+                label: statusLabel,
+                icon: statusIcon,
+              ),
             ],
           ),
           const SizedBox(height: 24),
           Card(
-            color: const Color(0xFF17483B),
+            color: isOn ? const Color(0xFF17483B) : const Color(0xFF3A3A3A),
             child: Padding(
               padding: const EdgeInsets.all(20),
               child: Row(
@@ -887,21 +971,25 @@ class PeopleScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(width: 14),
-                  const Expanded(
+                  Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          'Discovering nearby devices',
-                          style: TextStyle(
+                          _statusText,
+                          style: const TextStyle(
                             color: Colors.white,
                             fontWeight: FontWeight.w800,
                           ),
                         ),
-                        SizedBox(height: 4),
+                        const SizedBox(height: 4),
                         Text(
-                          'Bluetooth is on. Names stay hidden until you connect.',
-                          style: TextStyle(
+                          _btOff
+                              ? 'Bluetooth is off. Turn it on, then tap play again.'
+                              : _permDenied
+                                  ? 'Bluetooth permission denied. Enable it in Settings.'
+                                  : 'Uses BLE to find nearby resQ phones and sync offline.',
+                          style: const TextStyle(
                             color: Color(0xFFC4E3CC),
                             height: 1.3,
                           ),
@@ -910,9 +998,11 @@ class PeopleScreen extends StatelessWidget {
                     ),
                   ),
                   IconButton(
-                    onPressed: () {},
-                    icon: const Icon(
-                      Icons.pause_circle_outline_rounded,
+                    onPressed: _toggleMesh,
+                    icon: Icon(
+                      isOn
+                          ? Icons.pause_circle_outline_rounded
+                          : Icons.play_circle_outline_rounded,
                       color: Colors.white,
                     ),
                   ),
@@ -920,26 +1010,44 @@ class PeopleScreen extends StatelessWidget {
               ),
             ),
           ),
+          const SizedBox(height: 24),
+          FilledButton.icon(
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => MeshChatScreen(controller: _mesh),
+                ),
+              );
+            },
+            icon: const Icon(Icons.forum_outlined),
+            label: const Text('Open mesh chat'),
+          ),
           const SizedBox(height: 28),
           SectionTitle(title: 'Nearby devices', action: 'Scan'),
           const SizedBox(height: 10),
-          NearbyDevice(
-            name: 'resQ-7F2A',
-            detail: 'Seen now | BLE',
-            onConnect: () => _showPairing(context, 'resQ-7F2A'),
-          ),
-          const SizedBox(height: 10),
-          NearbyDevice(
-            name: 'resQ-19B8',
-            detail: 'Seen 1 min ago | BLE',
-            onConnect: () => _showPairing(context, 'resQ-19B8'),
-          ),
-          const SizedBox(height: 10),
-          NearbyDevice(
-            name: 'resQ-4D63',
-            detail: 'Seen 3 min ago | Wi-Fi ready',
-            onConnect: () => _showPairing(context, 'resQ-4D63'),
-          ),
+          if (_peerList.isEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(4, 8, 4, 8),
+              child: Text(
+                _state == MeshState.running
+                    ? 'Scanning… no resQ devices in range yet.'
+                    : 'Turn the mesh on to discover nearby resQ devices.',
+                style: TextStyle(color: Color(0xFF68736D), height: 1.3),
+              ),
+            )
+          else
+            ..._peerList.map(
+              (p) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: NearbyDevice(
+                  name: p.nickname,
+                  detail: p.lastSeen != null
+                      ? '${p.connected ? 'Connected' : 'Seen now'} | BLE'
+                      : 'BLE',
+                  onConnect: () => widget._showPairing(context, p.nickname),
+                ),
+              ),
+            ),
           const SizedBox(height: 28),
           SectionTitle(title: 'Your groups', action: 'Create'),
           const SizedBox(height: 10),
@@ -1368,7 +1476,7 @@ class SensorSheet extends StatelessWidget {
 }
 
 class StatusPill extends StatelessWidget {
-  const StatusPill({required this.label, required this.icon, super.key});
+  StatusPill({required this.label, required this.icon, super.key});
   final String label;
   final IconData icon;
 
