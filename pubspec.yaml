@@ -10,12 +10,14 @@ dependencies:
   battery_plus: ^6.1.1
   bluetooth_low_energy: ^6.2.1
   cryptography: ^2.9.0
+  flutter_secure_storage: ^9.2.4
   flutter:
     sdk: flutter
   geolocator: ^13.0.2
   permission_handler: ^12.0.3
   sensors_plus: ^6.1.1
   yjs_dart: ^1.1.15
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:

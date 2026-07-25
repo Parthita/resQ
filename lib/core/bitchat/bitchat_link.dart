@@ -114,15 +114,26 @@ class MockBitchatLink implements BitchatLink {
   @override
   Future<void> start() async {
     _started = true;
+    // Model the BLE link lifecycle as well as byte delivery.  The controller
+    // uses this to distinguish an accepted relationship from an available
+    // transport path.
+    for (final peer in _peers.where((peer) => peer._started)) {
+      _peerController.add(LinkPeer(id: peer.label, connected: true));
+      peer._peerController.add(LinkPeer(id: label, connected: true));
+    }
   }
 
   @override
   Future<void> stop() async {
     _started = false;
-    await _controller.close();
-    await _peerController.close();
+    for (final peer in _peers.where((peer) => peer._started)) {
+      peer._peerController.add(LinkPeer(id: label, connected: false));
+    }
   }
 
   @override
-  Future<void> dispose() async {}
+  Future<void> dispose() async {
+    await _controller.close();
+    await _peerController.close();
+  }
 }

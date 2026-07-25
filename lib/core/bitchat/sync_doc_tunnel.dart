@@ -1,7 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart';
+import 'dart:io';
+
+import 'package:path_provider/path_provider.dart';
 import 'package:yjs_dart/yjs_dart.dart';
 
 import 'bitchat_packet.dart';
@@ -30,6 +33,43 @@ class ChatMessage {
       senderId: m['s'] as String,
       text: m['m'] as String,
       timestamp: m['t'] as int,
+    );
+  }
+}
+
+/// Private conversation record replicated through the CRDT. Each device only
+/// renders records addressed to itself or authored by itself.
+class PersonalCrdtMessage {
+  PersonalCrdtMessage({
+    required this.id,
+    required this.senderId,
+    required this.recipientId,
+    required this.text,
+    required this.timestamp,
+  });
+
+  final String id;
+  final String senderId;
+  final String recipientId;
+  final String text;
+  final int timestamp;
+
+  String toWire() => jsonEncode({
+    'id': id,
+    'from': senderId,
+    'to': recipientId,
+    't': timestamp,
+    'm': text,
+  });
+
+  static PersonalCrdtMessage fromWire(String wire) {
+    final map = jsonDecode(wire) as Map<String, dynamic>;
+    return PersonalCrdtMessage(
+      id: map['id'] as String,
+      senderId: map['from'] as String,
+      recipientId: map['to'] as String,
+      text: map['m'] as String,
+      timestamp: map['t'] as int,
     );
   }
 }
@@ -68,11 +108,58 @@ class SyncDocTunnel {
 
   bool _typesReady = false;
 
+  // On-device persistence: the Yjs doc is saved after every local/remote
+  // mutation so chat history (including personal DMs) survives an app
+  // restart, not just a BLE link drop.
+  static const String _docFileName = 'resq_mesh_doc.yjs';
+  bool _loaded = false;
+
+  Future<String> get _docPath async {
+    final dir = await getApplicationDocumentsDirectory();
+    return '${dir.path}/$_docFileName';
+  }
+
+  /// Persist a full Yjs state snapshot to disk. Best-effort: a failure (e.g.
+  /// headless test env with no real documents dir) degrades to in-memory only.
+  // ponytail: writes the whole doc each time (simple, O(docSize)). Fine at
+  // this app's scale; switch to incremental updates only if docs grow large.
+  Future<void> _persist() async {
+    try {
+      final bytes = encodeStateAsUpdate(doc);
+      final file = File(await _docPath);
+      await file.writeAsBytes(bytes);
+    } on Object catch (error) {
+      debugPrint('[resq:crdt] persist failed: $error');
+    }
+  }
+
+  /// Load a previously saved snapshot into this doc. Called once at start,
+  /// before the router begins delivering packets.
+  Future<void> load() async {
+    if (_loaded) return;
+    _loaded = true;
+    try {
+      final file = File(await _docPath);
+      if (await file.exists()) {
+        final bytes = await file.readAsBytes();
+        if (bytes.isNotEmpty) {
+          doc.transact((tr) => applyUpdate(doc, bytes), this);
+          debugPrint('[resq:crdt] loaded persisted doc (${bytes.length} bytes)');
+        }
+      }
+    } on Object catch (error) {
+      // Any load failure (missing file, corrupt bytes, no platform dir) must
+      // not block mesh startup. Degrades to an empty in-memory doc.
+      debugPrint('[resq:crdt] load failed: $error');
+    }
+  }
+
   /// Append-only chat log. Pre-declared so incoming updates bind correctly.
   late final YArray<String> messages;
 
   /// Per-peer presence: senderId(hex) -> nickname.
   late final YMap presence;
+  late final YArray<String> personalMessages;
 
   final StreamController<void> _changed = StreamController<void>.broadcast();
   final StreamController<String> _deliveredDoc =
@@ -91,8 +178,10 @@ class SyncDocTunnel {
     doc.getText(docName);
     messages = doc.getArray('messages')!;
     presence = doc.getMap('presence')!;
+    personalMessages = doc.getArray('personal_messages')!;
     messages.observe((_, _) => _changed.add(null));
     presence.observe((_, _) => _changed.add(null));
+    personalMessages.observe((_, _) => _changed.add(null));
     _typesReady = true;
   }
 
@@ -105,6 +194,7 @@ class SyncDocTunnel {
   /// Begin: declare types, listen for incoming sync packets, start router.
   Future<void> start() async {
     declareDefaultTypes();
+    await load();
     router.delivered.listen(_onDelivered);
     await router.start();
   }
@@ -116,6 +206,7 @@ class SyncDocTunnel {
     doc.transact((tr) {
       applyUpdate(doc, packet.payload);
     }, this);
+    unawaited(_persist());
     _deliveredDoc.add(docName);
     _changed.add(null);
   }
@@ -134,6 +225,7 @@ class SyncDocTunnel {
     }, this);
     _changed.add(null);
     await broadcastUpdate();
+    unawaited(_persist());
   }
 
   /// Record/refresh a peer's nickname in the shared presence map.
@@ -144,6 +236,7 @@ class SyncDocTunnel {
     }, this);
     _changed.add(null);
     await broadcastUpdate();
+    unawaited(_persist());
   }
 
   /// Snapshot the chat log as ordered [ChatMessage]s for the UI.
@@ -155,6 +248,44 @@ class SyncDocTunnel {
       } on Object {
         // skip a malformed entry rather than crashing the UI
       }
+    }
+    return out;
+  }
+
+  Future<void> appendPersonalMessage({
+    required String recipientId,
+    required String text,
+    required int timestamp,
+  }) async {
+    declareDefaultTypes();
+    final sender = _hex(senderId);
+    final message = PersonalCrdtMessage(
+      id: '$sender:$timestamp',
+      senderId: sender,
+      recipientId: recipientId,
+      text: text,
+      timestamp: timestamp,
+    );
+    doc.transact((tr) => personalMessages.push([message.toWire()]), this);
+    _changed.add(null);
+    await broadcastUpdate();
+    unawaited(_persist());
+  }
+
+  List<PersonalCrdtMessage> personalMessagesFor({
+    required String me,
+    required String peer,
+  }) {
+    declareDefaultTypes();
+    final out = <PersonalCrdtMessage>[];
+    for (var i = 0; i < personalMessages.length; i++) {
+      try {
+        final message = PersonalCrdtMessage.fromWire(personalMessages.get(i));
+        if ((message.senderId == me && message.recipientId == peer) ||
+            (message.senderId == peer && message.recipientId == me)) {
+          out.add(message);
+        }
+      } on Object {}
     }
     return out;
   }

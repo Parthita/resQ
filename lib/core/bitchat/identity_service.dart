@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:cryptography/cryptography.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import 'bitchat_packet.dart';
 
@@ -21,6 +23,12 @@ import 'bitchat_packet.dart';
 ///   * Signatures cover packet.toBinaryDataForSigning() (ttl forced to 0,
 ///     signature omitted, isRSR omitted).
 class MeshIdentity {
+  static const _noisePrivateKey = 'resq.mesh.identity.noise.private.v1';
+  static const _noisePublicKey = 'resq.mesh.identity.noise.public.v1';
+  static const _signingPrivateKey = 'resq.mesh.identity.signing.private.v1';
+  static const _signingPublicKey = 'resq.mesh.identity.signing.public.v1';
+  static const _storage = FlutterSecureStorage();
+
   MeshIdentity._({
     required this.noisePrivateKey,
     required this.noisePublicKey,
@@ -58,6 +66,75 @@ class MeshIdentity {
       signingPublicKey: Uint8List.fromList(signingPub.bytes),
       senderId: senderId,
     );
+  }
+
+  /// Load the device's long-lived BitChat identity, creating it once on first
+  /// use. Private key material is stored through the platform keystore (not
+  /// in app files or preferences), so contacts retain the same sender ID
+  /// after process restarts and app updates.
+  static Future<MeshIdentity> loadOrCreate() async {
+    try {
+      final values = await Future.wait([
+        _storage.read(key: _noisePrivateKey),
+        _storage.read(key: _noisePublicKey),
+        _storage.read(key: _signingPrivateKey),
+        _storage.read(key: _signingPublicKey),
+      ]);
+      if (values.every((value) => value != null)) {
+        final noisePrivate = base64Decode(values[0]!);
+        final noisePublic = base64Decode(values[1]!);
+        final signingPrivate = base64Decode(values[2]!);
+        final signingPublic = base64Decode(values[3]!);
+        if (noisePrivate.length == 32 &&
+            noisePublic.length == 32 &&
+            signingPrivate.length == 32 &&
+            signingPublic.length == 32) {
+          return MeshIdentity._(
+            noisePrivateKey: SimpleKeyPairData(
+              noisePrivate,
+              publicKey: SimplePublicKey(noisePublic, type: KeyPairType.x25519),
+              type: KeyPairType.x25519,
+            ),
+            noisePublicKey: Uint8List.fromList(noisePublic),
+            signingPrivateKey: SimpleKeyPairData(
+              signingPrivate,
+              publicKey: SimplePublicKey(
+                signingPublic,
+                type: KeyPairType.ed25519,
+              ),
+              type: KeyPairType.ed25519,
+            ),
+            signingPublicKey: Uint8List.fromList(signingPublic),
+            senderId: await deriveSenderId(Uint8List.fromList(noisePublic)),
+          );
+        }
+      }
+
+      final identity = await generate();
+      await Future.wait([
+        _storage.write(
+          key: _noisePrivateKey,
+          value: base64Encode(identity.noisePrivateKey.bytes),
+        ),
+        _storage.write(
+          key: _noisePublicKey,
+          value: base64Encode(identity.noisePublicKey),
+        ),
+        _storage.write(
+          key: _signingPrivateKey,
+          value: base64Encode(identity.signingPrivateKey.bytes),
+        ),
+        _storage.write(
+          key: _signingPublicKey,
+          value: base64Encode(identity.signingPublicKey),
+        ),
+      ]);
+      return identity;
+    } on Object {
+      // Headless tests and unsupported platforms can lack a platform keystore.
+      // Keep the transport functional there; Android/iOS use secure storage.
+      return generate();
+    }
   }
 
   /// Derive the 8-byte sender/peer ID from a Noise static public key.
@@ -104,9 +181,13 @@ class MeshIdentity {
     try {
       final ok = await Ed25519().verify(
         signingBytes,
-        signature: Signature(signature,
-            publicKey: SimplePublicKey(ed25519PublicKey,
-                type: KeyPairType.ed25519)),
+        signature: Signature(
+          signature,
+          publicKey: SimplePublicKey(
+            ed25519PublicKey,
+            type: KeyPairType.ed25519,
+          ),
+        ),
       );
       return ok;
     } on Exception {

@@ -32,7 +32,13 @@ class BluetoothOffException implements Exception {
 }
 
 class BleLink implements BitchatLink {
-  BleLink({this.useMainnet = false});
+  BleLink({this.useMainnet = false})
+    : _serviceUuid = UUID.fromString(
+        useMainnet
+            ? BitchatConstants.serviceUuidMainnet
+            : BitchatConstants.serviceUuidTestnet,
+      ),
+      _charUuid = UUID.fromString(BitchatConstants.characteristicUuid);
 
   final bool useMainnet;
 
@@ -52,9 +58,13 @@ class BleLink implements BitchatLink {
   bool _advertising = false;
   bool _scanning = false;
   Timer? _scanHeartbeat;
+  final List<StreamSubscription> _subscriptions = [];
+  bool _started = false;
+  bool _adapterWasDown = false;
+  bool _recoveringAdapter = false;
 
-  late final UUID _serviceUuid;
-  late final UUID _charUuid;
+  final UUID _serviceUuid;
+  final UUID _charUuid;
   late final GATTService _service;
   late final GATTCharacteristic _mutableChar;
 
@@ -69,70 +79,77 @@ class BleLink implements BitchatLink {
 
   @override
   Future<void> start() async {
+    _started = true;
     // React to adapter state changes (e.g. auto-request authorization on
     // Android when the system reports 'unauthorized').
-    _central.stateChanged.listen((args) {
-      if (args.state == BluetoothLowEnergyState.unauthorized) {
-        unawaited(_central.authorize());
-      }
-    });
-    _peripheral.stateChanged.listen((args) {
-      if (args.state == BluetoothLowEnergyState.unauthorized) {
-        unawaited(_peripheral.authorize());
-      }
-    });
+    _subscriptions.add(
+      _central.stateChanged.listen((args) {
+        if (args.state == BluetoothLowEnergyState.unauthorized) {
+          unawaited(_central.authorize());
+        }
+        _onAdapterStateChanged(args.state);
+      }),
+    );
+    _subscriptions.add(
+      _peripheral.stateChanged.listen((args) {
+        if (args.state == BluetoothLowEnergyState.unauthorized) {
+          unawaited(_peripheral.authorize());
+        }
+        _onAdapterStateChanged(args.state);
+      }),
+    );
     // These are the authoritative disconnect callbacks.  Relying on a failed
     // write leaves the People UI showing a stale "Connected" state until the
     // next scan result arrives.
-    _central.connectionStateChanged.listen((args) {
-      final id = args.peripheral.uuid.toString();
-      if (args.state == ConnectionState.disconnected) {
-        _connecting.remove(id);
-        _connected.remove(id);
-        if (identical(_centralPeripheral, args.peripheral)) {
-          _centralPeripheral = null;
-          _centralChar = null;
+    _subscriptions.add(
+      _central.connectionStateChanged.listen((args) {
+        final id = args.peripheral.uuid.toString();
+        if (args.state == ConnectionState.disconnected) {
+          _connecting.remove(id);
+          _connected.remove(id);
+          if (identical(_centralPeripheral, args.peripheral)) {
+            _centralPeripheral = null;
+            _centralChar = null;
+          }
         }
-      }
-      if (!_peersController.isClosed) {
-        _peersController.add(
-          LinkPeer(id: id, connected: args.state == ConnectionState.connected),
-        );
-      }
-    });
-    _peripheral.connectionStateChanged.listen((args) {
-      final id = args.central.uuid.toString();
-      if (args.state == ConnectionState.connected) {
-        _inboundCentrals.add(id);
-        debugPrint(
-          '[bitchat:ble] inbound central connected $id; suppressing outbound races',
-        );
-      }
-      if (args.state == ConnectionState.disconnected) {
-        _subscribedCentrals.remove(args.central);
-        _inboundCentrals.remove(id);
-      }
-      if (!_peersController.isClosed) {
-        _peersController.add(
-          LinkPeer(
-            id: args.central.uuid.toString(),
-            connected: args.state == ConnectionState.connected,
-          ),
-        );
-      }
-    });
+        if (!_peersController.isClosed) {
+          _peersController.add(
+            LinkPeer(
+              id: id,
+              connected: args.state == ConnectionState.connected,
+            ),
+          );
+        }
+      }),
+    );
+    _subscriptions.add(
+      _peripheral.connectionStateChanged.listen((args) {
+        final id = args.central.uuid.toString();
+        if (args.state == ConnectionState.connected) {
+          _inboundCentrals.add(id);
+          debugPrint(
+            '[bitchat:ble] inbound central connected $id; suppressing outbound races',
+          );
+        }
+        if (args.state == ConnectionState.disconnected) {
+          _subscribedCentrals.remove(args.central);
+          _inboundCentrals.remove(id);
+        }
+        if (!_peersController.isClosed) {
+          _peersController.add(
+            LinkPeer(
+              id: args.central.uuid.toString(),
+              connected: args.state == ConnectionState.connected,
+            ),
+          );
+        }
+      }),
+    );
 
     // The managers commonly begin as `unknown`, especially immediately after
     // the runtime permission prompt. Wait for the native callback instead of
     // treating that transient state as Bluetooth being off.
     await _waitForPoweredOn();
-
-    _serviceUuid = UUID.fromString(
-      useMainnet
-          ? BitchatConstants.serviceUuidMainnet
-          : BitchatConstants.serviceUuidTestnet,
-    );
-    _charUuid = UUID.fromString(BitchatConstants.characteristicUuid);
 
     // --- peripheral setup ---
     _mutableChar = GATTCharacteristic.mutable(
@@ -156,53 +173,72 @@ class BleLink implements BitchatLink {
       characteristics: [_mutableChar],
     );
 
-    _peripheral.characteristicWriteRequested.listen(_onWriteRequested);
-    _peripheral.characteristicNotifyStateChanged.listen((args) {
-      if (args.state) {
-        _subscribedCentrals.add(args.central);
-        debugPrint('[bitchat:ble] central subscribed ${args.central.uuid}');
-        // A central has completed the GATT notify subscription.  This is the
-        // first moment the peripheral can reliably send a packet back, so
-        // surface a fresh connected event for the controller to announce its
-        // signed BitChat identity (matching BitChat's didSubscribe flow).
-        if (!_peersController.isClosed) {
-          _peersController.add(
-            LinkPeer(id: args.central.uuid.toString(), connected: true),
-          );
+    _subscriptions.add(
+      _peripheral.characteristicWriteRequested.listen(_onWriteRequested),
+    );
+    _subscriptions.add(
+      _peripheral.characteristicNotifyStateChanged.listen((args) {
+        if (args.state) {
+          _subscribedCentrals.add(args.central);
+          debugPrint('[bitchat:ble] central subscribed ${args.central.uuid}');
+          // A central has completed the GATT notify subscription.  This is the
+          // first moment the peripheral can reliably send a packet back, so
+          // surface a fresh connected event for the controller to announce its
+          // signed BitChat identity (matching BitChat's didSubscribe flow).
+          if (!_peersController.isClosed) {
+            _peersController.add(
+              LinkPeer(id: args.central.uuid.toString(), connected: true),
+            );
+          }
+        } else {
+          _subscribedCentrals.remove(args.central);
+          debugPrint('[bitchat:ble] central unsubscribed ${args.central.uuid}');
         }
-      } else {
-        _subscribedCentrals.remove(args.central);
-        debugPrint('[bitchat:ble] central unsubscribed ${args.central.uuid}');
+      }),
+    );
+    // Android's GATT server can retain services across a transport restart.
+    // Reset it before registering our one authoritative service so a retry
+    // cannot throw `IllegalStateException` for an already-added UUID. If the
+    // platform server is temporarily unavailable, keep the central/scanner
+    // role alive: the phone can still connect to another resQ advertiser.
+    final gattServerReady = await _registerGattServiceWithRetry(_service);
+    if (gattServerReady) {
+      try {
+        await _peripheral.startAdvertising(
+          Advertisement(name: 'resQ', serviceUUIDs: [_serviceUuid]),
+        );
+        _advertising = true;
+        debugPrint('[bitchat:ble] advertising service $_serviceUuid as "resQ"');
+      } on Object catch (error, stackTrace) {
+        // Android may reject LE advertising when the controller has exhausted
+        // advertiser slots or does not support the peripheral role. Scanning is
+        // still useful: this phone can join a nearby resQ advertiser as central.
+        // Do not take the entire mesh down for a peripheral-only limitation.
+        _advertising = false;
+        debugPrint(
+          '[bitchat:ble] advertising unavailable; continuing scan: '
+          '$error\n$stackTrace',
+        );
       }
-    });
-    await _peripheral.addService(_service);
-    try {
-      await _peripheral.startAdvertising(
-        Advertisement(name: 'resQ', serviceUUIDs: [_serviceUuid]),
-      );
-      _advertising = true;
-      debugPrint('[bitchat:ble] advertising service $_serviceUuid as "resQ"');
-    } on Object catch (error, stackTrace) {
-      // Android may reject LE advertising when the controller has exhausted
-      // advertiser slots or does not support the peripheral role. Scanning is
-      // still useful: this phone can join a nearby resQ advertiser as central.
-      // Do not take the entire mesh down for a peripheral-only limitation.
-      _advertising = false;
-      debugPrint(
-        '[bitchat:ble] advertising unavailable; continuing scan: '
-        '$error\n$stackTrace',
-      );
     }
 
     // --- central setup ---
-    _central.discovered.listen(_onDiscovered);
-    _central.characteristicNotified.listen(_onNotified);
-    _central.mtuChanged.listen((args) {
-      debugPrint('[bitchat:ble] MTU updated peer=${args.peripheral.uuid} mtu=${args.mtu}');
-    });
-    _peripheral.mtuChanged.listen((args) {
-      debugPrint('[bitchat:ble] MTU updated central=${args.central.uuid} mtu=${args.mtu}');
-    });
+    _subscriptions.add(_central.discovered.listen(_onDiscovered));
+    _subscriptions.add(_central.characteristicNotified.listen(_onNotified));
+    _subscriptions.add(
+      _central.mtuChanged.listen((args) {
+        debugPrint(
+          '[bitchat:ble] MTU updated peer=${args.peripheral.uuid} mtu=${args.mtu}',
+        );
+      }),
+    );
+    _subscriptions.add(
+      _peripheral.mtuChanged.listen((args) {
+        debugPrint(
+          '[bitchat:ble] MTU updated central=${args.central.uuid} mtu=${args.mtu}',
+        );
+      }),
+    );
     debugPrint(
       '[bitchat:ble] scan filter UUID = $_serviceUuid '
       '(advertise UUID = $_serviceUuid, char = $_charUuid)',
@@ -224,6 +260,106 @@ class BleLink implements BitchatLink {
         );
       }
     });
+  }
+
+  void _onAdapterStateChanged(BluetoothLowEnergyState state) {
+    if (state == BluetoothLowEnergyState.poweredOff) {
+      _adapterWasDown = true;
+      _emitDisconnectedPeers(reason: 'adapter powered off');
+      debugPrint(
+        '[bitchat:ble] adapter powered off; transport will recover on power on',
+      );
+      return;
+    }
+    if (state == BluetoothLowEnergyState.poweredOn &&
+        _adapterWasDown &&
+        _started &&
+        isPoweredOn) {
+      _adapterWasDown = false;
+      unawaited(_recoverAfterAdapterReset());
+    }
+  }
+
+  /// Android can briefly retain a GATT server after a process or radio reset.
+  /// A small bounded retry gives the Bluetooth stack time to release it before
+  /// degrading to scan-only for this session.
+  Future<bool> _registerGattServiceWithRetry(GATTService service) async {
+    Object? lastError;
+    StackTrace? lastStackTrace;
+    for (var attempt = 1; attempt <= 3; attempt++) {
+      try {
+        await _peripheral.removeAllServices();
+        await _peripheral.addService(service);
+        if (attempt > 1) {
+          debugPrint('[bitchat:ble] GATT service registered on retry $attempt');
+        }
+        return true;
+      } on Object catch (error, stackTrace) {
+        lastError = error;
+        lastStackTrace = stackTrace;
+        debugPrint(
+          '[bitchat:ble] GATT service registration attempt $attempt/3 failed: '
+          '$error',
+        );
+        if (attempt < 3) {
+          await Future<void>.delayed(Duration(milliseconds: 300 * attempt));
+        }
+      }
+    }
+    debugPrint(
+      '[bitchat:ble] GATT service unavailable after retries; '
+      'continuing scan-only: $lastError\n$lastStackTrace',
+    );
+    return false;
+  }
+
+  Future<void> _recoverAfterAdapterReset() async {
+    if (_recoveringAdapter || !_started) return;
+    _recoveringAdapter = true;
+    try {
+      debugPrint(
+        '[bitchat:ble] adapter restored; rebuilding GATT server and scanner',
+      );
+      try {
+        await _central.stopDiscovery();
+      } on Object {
+        // The adapter reset may already have invalidated the scanner.
+      }
+      try {
+        await _peripheral.stopAdvertising();
+      } on Object {
+        // The adapter reset may already have invalidated the advertiser.
+      }
+      _scanning = false;
+      _advertising = false;
+      _emitDisconnectedPeers(reason: 'adapter reset');
+      _connecting.clear();
+
+      final serviceReady = await _registerGattServiceWithRetry(_service);
+      if (serviceReady) {
+        try {
+          await _peripheral.startAdvertising(
+            Advertisement(name: 'resQ', serviceUUIDs: [_serviceUuid]),
+          );
+          _advertising = true;
+        } on Object catch (error, stackTrace) {
+          debugPrint(
+            '[bitchat:ble] adapter recovery advertising failed: '
+            '$error\n$stackTrace',
+          );
+        }
+      }
+      await _central.startDiscovery(serviceUUIDs: [_serviceUuid]);
+      _scanning = true;
+      debugPrint(
+        '[bitchat:ble] adapter recovery complete; '
+        'scanning=$_scanning advertising=$_advertising',
+      );
+    } on Object catch (error, stackTrace) {
+      debugPrint('[bitchat:ble] adapter recovery failed: $error\n$stackTrace');
+    } finally {
+      _recoveringAdapter = false;
+    }
   }
 
   Future<void> _waitForPoweredOn() async {
@@ -402,6 +538,8 @@ class BleLink implements BitchatLink {
 
   @override
   Future<void> stop() async {
+    _started = false;
+    _adapterWasDown = false;
     _scanHeartbeat?.cancel();
     if (_scanning) await _central.stopDiscovery();
     if (_advertising) await _peripheral.stopAdvertising();
@@ -415,20 +553,47 @@ class BleLink implements BitchatLink {
         // ignore
       }
     }
-    _connected.clear();
+    _emitDisconnectedPeers(reason: 'transport stop');
     _connecting.clear();
-    _inboundCentrals.clear();
-    _subscribedCentrals.clear();
+    _scanning = false;
+    _advertising = false;
     // NOTE: do NOT close _received / _peersController here. A discovery or
     // notify callback may still be in flight; closing now throws
     // "Cannot add new events after calling close". The controllers are only
     // closed in dispose(), when the link is truly discarded.
   }
 
+  void _emitDisconnectedPeers({required String reason}) {
+    final ids = <String>{
+      ..._connected.keys,
+      ..._inboundCentrals,
+      ..._subscribedCentrals.map((central) => central.uuid.toString()),
+      if (_centralPeripheral != null) _centralPeripheral!.uuid.toString(),
+    };
+    for (final id in ids) {
+      if (!_peersController.isClosed) {
+        _peersController.add(LinkPeer(id: id, connected: false));
+      }
+    }
+    if (ids.isNotEmpty) {
+      debugPrint('[bitchat:ble] emitted ${ids.length} disconnects ($reason)');
+    }
+    _connected.clear();
+    _inboundCentrals.clear();
+    _subscribedCentrals.clear();
+    _centralPeripheral = null;
+    _centralChar = null;
+  }
+
   /// Permanently release the link's streams. Call when the owning controller
   /// is disposed (and the link will not be reused).
   @override
   Future<void> dispose() async {
+    await stop();
+    for (final subscription in _subscriptions) {
+      await subscription.cancel();
+    }
+    _subscriptions.clear();
     if (!_received.isClosed) await _received.close();
     if (!_peersController.isClosed) await _peersController.close();
   }

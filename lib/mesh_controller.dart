@@ -84,7 +84,13 @@ class MeshController {
   final _messagesController = StreamController<PersonalMessage>.broadcast();
   StreamSubscription<LinkPeer>? _peerSubscription;
   StreamSubscription<BitchatPacket>? _packetSubscription;
+  StreamSubscription<void>? _docSubscription;
   Timer? _presenceTimer;
+  Timer? _peerSweepTimer;
+  bool _transportStarted = false;
+  bool _replayingRequests = false;
+  bool _resyncingDoc = false;
+  final Set<String> _seenPersonalCrdtIds = <String>{};
 
   /// People discovered by the resQ protocol (not merely by a BLE scan).
   /// A contact cannot be messaged until they accept a connection request.
@@ -151,7 +157,7 @@ class MeshController {
     _ensureLink();
 
     try {
-      identity = await MeshIdentity.generate();
+      identity = await MeshIdentity.loadOrCreate();
       debugPrint('[resq:mesh] identity ready id=${_hex(identity.senderId)}');
       router = FloodRouter(link: _link!, chunkSize: 469);
       tunnel = SyncDocTunnel(router: router, senderId: identity.senderId);
@@ -165,6 +171,9 @@ class MeshController {
       // applies CRDT updates. To enforce identity, pass a verifier built from a
       // learned key table (populated from announce TLV 0x03).
       await tunnel.start();
+      _transportStarted = true;
+      await _docSubscription?.cancel();
+      _docSubscription = tunnel.changed.listen((_) => _syncPersonalMessagesFromDoc());
       await _packetSubscription?.cancel();
       _packetSubscription = router.delivered.listen(_onPacket);
       // Mark running before announcing. A BLE connection can complete while
@@ -180,6 +189,11 @@ class MeshController {
       _presenceTimer = Timer.periodic(
         const Duration(seconds: 2),
         (_) => unawaited(_announce()),
+      );
+      _peerSweepTimer?.cancel();
+      _peerSweepTimer = Timer.periodic(
+        const Duration(seconds: 10),
+        (_) => _evictStalePeers(),
       );
     } on BluetoothOffException {
       // Adapter is off — drop back to stopped and let the UI show the hint.
@@ -226,20 +240,92 @@ class MeshController {
       // channels are ready. Repeat after each real link establishment so the
       // other phone can become a visible resQ person.
       unawaited(_announce());
+      unawaited(_resyncDocumentAfterLink());
+      unawaited(_replayPendingRequests());
+      _setAcceptedContactsLinkState(true);
     }
-    // A physical link loss makes every personal conversation unavailable.
-    // We keep the accepted contact (rather than silently deleting it), but the
-    // UI immediately closes its composer and clearly shows it as disconnected.
+    // A physical link loss makes every accepted conversation unavailable. The
+    // acceptance itself remains durable; only its transport availability
+    // changes, so reconnecting does not require another approval.
     if (!p.connected && !_peers.any((peer) => peer.connected)) {
-      var changed = false;
-      for (final contact in _contacts.values) {
-        if (contact.status == ConnectionStatus.connected) {
-          contact.status = ConnectionStatus.disconnected;
-          changed = true;
+      _setAcceptedContactsLinkState(false);
+    }
+  }
+
+  void _evictStalePeers() {
+    final cutoff = DateTime.now().subtract(const Duration(seconds: 20));
+    final countBefore = _peers.length;
+    _peers.removeWhere(
+      (peer) => !peer.connected && (peer.lastSeen?.isBefore(cutoff) ?? true),
+    );
+    if (_peers.length != countBefore) _peerController.add(List.of(_peers));
+  }
+
+  Future<void> _replayPendingRequests() async {
+    if (_replayingRequests) {
+      debugPrint('[resq:mesh] request replay skipped (already running)');
+      return;
+    }
+    _replayingRequests = true;
+    try {
+      for (final contact in List<PersonalContact>.of(_contacts.values)) {
+        try {
+          if (contact.status == ConnectionStatus.outgoingPending) {
+            debugPrint('[resq:mesh] replay pending request to=${contact.id}');
+            await _sendEnvelope({
+              'kind': 'request',
+              'name': 'resQ',
+            }, recipient: contact.id);
+          } else if (contact.accepted) {
+            debugPrint('[resq:mesh] replay accepted response to=${contact.id}');
+            await _sendEnvelope({
+              'kind': 'response',
+              'accepted': true,
+              'name': 'resQ',
+            }, recipient: contact.id);
+          }
+        } on Object catch (error, stackTrace) {
+          debugPrint(
+            '[resq:mesh] request replay failed contact=${contact.id}: $error\n$stackTrace',
+          );
         }
       }
-      if (changed) _emitContacts();
+    } finally {
+      _replayingRequests = false;
     }
+  }
+
+  Future<void> _resyncDocumentAfterLink() async {
+    if (_resyncingDoc) {
+      debugPrint('[resq:mesh] CRDT resync skipped (already running)');
+      return;
+    }
+    _resyncingDoc = true;
+    try {
+      debugPrint('[resq:mesh] CRDT resync start (full Yjs update)');
+      await tunnel.broadcastUpdate();
+      debugPrint('[resq:mesh] CRDT resync complete');
+    } on Object catch (error, stackTrace) {
+      debugPrint('[resq:mesh] CRDT resync failed: $error\n$stackTrace');
+    } finally {
+      _resyncingDoc = false;
+    }
+  }
+
+  void _setAcceptedContactsLinkState(bool linkUp) {
+    var changed = false;
+    for (final contact in _contacts.values) {
+      if (!contact.accepted) continue;
+      final next = linkUp
+          ? ConnectionStatus.connected
+          : ConnectionStatus.disconnected;
+      if (contact.linkUp != linkUp || contact.status != next) {
+        contact.linkUp = linkUp;
+        contact.status = next;
+        changed = true;
+      }
+    }
+    if (changed) _emitContacts();
   }
 
   Future<void> _announce() async {
@@ -267,7 +353,11 @@ class MeshController {
   /// Ask a discovered person for a private conversation. This only creates an
   /// outgoing pending state; it never marks either side connected on its own.
   Future<void> requestConnection(PersonalContact contact) async {
-    if (!isStarted || contact.status == ConnectionStatus.connected) return;
+    if (!isStarted ||
+        contact.accepted ||
+        contact.status == ConnectionStatus.connected) {
+      return;
+    }
     contact.status = ConnectionStatus.outgoingPending;
     debugPrint('[resq:mesh] request send to=${contact.id}');
     _emitContacts();
@@ -281,8 +371,12 @@ class MeshController {
   /// to connected; rejection leaves no chat route open.
   Future<void> respondToRequest(PersonalContact contact, bool accept) async {
     if (contact.status != ConnectionStatus.incomingPending) return;
+    contact.accepted = accept;
+    contact.linkUp = accept && _peers.any((peer) => peer.connected);
     contact.status = accept
-        ? ConnectionStatus.connected
+        ? (contact.linkUp
+              ? ConnectionStatus.connected
+              : ConnectionStatus.disconnected)
         : ConnectionStatus.rejected;
     debugPrint(
       '[resq:mesh] request response to=${contact.id} accepted=$accept',
@@ -297,21 +391,36 @@ class MeshController {
 
   Future<bool> sendPersonalMessage(PersonalContact contact, String text) async {
     final clean = text.trim();
-    if (clean.isEmpty ||
-        contact.status != ConnectionStatus.connected ||
-        !isStarted) {
+    // Acceptance is sufficient to queue a private message. A missing BLE link
+    // only delays delivery; the CRDT sync will carry it after reconnect.
+    if (clean.isEmpty || !contact.accepted || !isStarted) {
       return false;
     }
-    final message = PersonalMessage(
-      contactId: contact.id,
+    await tunnel.appendPersonalMessage(
+      recipientId: contact.id,
       text: clean,
-      timestamp: DateTime.now(),
-      isMine: true,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
     );
-    (_messages[contact.id] ??= []).add(message);
-    _messagesController.add(message);
-    await _sendEnvelope({'kind': 'chat', 'text': clean}, recipient: contact.id);
+    _syncPersonalMessagesFromDoc();
     return true;
+  }
+
+  void _syncPersonalMessagesFromDoc() {
+    if (!isStarted) return;
+    final me = myIdHex;
+    for (final contact in _contacts.values) {
+      for (final record in tunnel.personalMessagesFor(me: me, peer: contact.id)) {
+        if (!_seenPersonalCrdtIds.add(record.id)) continue;
+        final message = PersonalMessage(
+          contactId: contact.id,
+          text: record.text,
+          timestamp: DateTime.fromMillisecondsSinceEpoch(record.timestamp),
+          isMine: record.senderId == me,
+        );
+        (_messages[contact.id] ??= []).add(message);
+        _messagesController.add(message);
+      }
+    }
   }
 
   Future<void> _onPacket(BitchatPacket packet) async {
@@ -350,8 +459,13 @@ class MeshController {
         );
         if (announce.nickname.isNotEmpty) contact.name = announce.nickname;
         contact.signingKey = announce.signingPublicKey;
+        if (contact.accepted && _peers.any((peer) => peer.connected)) {
+          contact.linkUp = true;
+          contact.status = ConnectionStatus.connected;
+        }
         debugPrint('[resq:mesh] announce verified from=$sender new=$isNew');
         _bindRawPeerToIdentity(sender, contact.name);
+        _syncPersonalMessagesFromDoc();
         _emitContacts();
         if (isNew) unawaited(_announce());
         return;
@@ -401,23 +515,42 @@ class MeshController {
           if (isNewContact) unawaited(_announce());
           break;
         case 'request':
-          if (contact.status != ConnectionStatus.connected) {
+          if (contact.accepted) {
+            // The sender may be replaying after reconnect. Confirm the
+            // already-approved relationship instead of showing a duplicate
+            // acceptance dialog.
+            unawaited(
+              _sendEnvelope({
+                'kind': 'response',
+                'accepted': true,
+                'name': 'resQ',
+              }, recipient: sender),
+            );
+          } else if (contact.status != ConnectionStatus.connected) {
             contact.status = ConnectionStatus.incomingPending;
           }
           debugPrint('[resq:mesh] request received from=$sender');
           break;
         case 'response':
-          contact.status = body['accepted'] == true
-              ? ConnectionStatus.connected
+          contact.accepted = body['accepted'] == true;
+          contact.linkUp =
+              contact.accepted && _peers.any((peer) => peer.connected);
+          contact.status = contact.accepted
+              ? (contact.linkUp
+                    ? ConnectionStatus.connected
+                    : ConnectionStatus.disconnected)
               : ConnectionStatus.rejected;
           debugPrint(
             '[resq:mesh] request response received from=$sender accepted=${body['accepted'] == true}',
           );
           break;
         case 'chat':
-          if (contact.status != ConnectionStatus.connected) return;
+          if (!contact.canChat) return;
           final text = body['text'] as String?;
           if (text == null || text.trim().isEmpty) return;
+          // De-dupe against the same message arriving later via CRDT resync.
+          // Key must match PersonalCrdtMessage.id ($sender:$timestamp).
+          if (!_seenPersonalCrdtIds.add('$sender:${packet.timestamp}')) break;
           final message = PersonalMessage(
             contactId: sender,
             text: text,
@@ -522,9 +655,16 @@ class MeshController {
     debugPrint('[resq:mesh] stopping');
     _presenceTimer?.cancel();
     _presenceTimer = null;
-    await tunnel.stop();
+    _peerSweepTimer?.cancel();
+    _peerSweepTimer = null;
+    if (_transportStarted) {
+      await tunnel.stop();
+      _transportStarted = false;
+    }
     await _packetSubscription?.cancel();
     _packetSubscription = null;
+    await _docSubscription?.cancel();
+    _docSubscription = null;
     await _peerSubscription?.cancel();
     _peerSubscription = null;
     _peers.clear();
@@ -533,7 +673,13 @@ class MeshController {
     debugPrint('[resq:mesh] stopped');
     // Drop the BLE link so the next start() builds a fresh one (the old link's
     // GATT server/scan was torn down and its controllers closed).
+    final oldLink = _link;
     _link = null;
+    // A fresh start needs fresh native subscriptions.  Keeping a stopped
+    // BleLink alive duplicates GATT callbacks on every toggle.
+    if (oldLink != null && !identical(oldLink, _preferredLink)) {
+      await oldLink.dispose();
+    }
     // NOTE: do NOT close _stateController / _peerController here. Closing them
     // makes a later start() throw when it calls _setState(). They are only
     // closed in dispose(), when the controller is truly gone.
@@ -542,7 +688,9 @@ class MeshController {
   /// Permanently release resources. Call when the owning widget is disposed.
   Future<void> dispose() async {
     await stop();
-    await _link?.dispose();
+    // Injected links are owned by the caller during ordinary stop/start
+    // cycles, but a permanently disposed controller can release them too.
+    await _preferredLink?.dispose();
     await _stateController.close();
     await _peerController.close();
     await _contactsController.close();
@@ -582,11 +730,17 @@ class PersonalContact {
     required this.id,
     required this.name,
     this.status = ConnectionStatus.available,
+    this.accepted = false,
+    this.linkUp = false,
   });
   final String id;
   String name;
   ConnectionStatus status;
+  bool accepted;
+  bool linkUp;
   Uint8List? signingKey;
+
+  bool get canChat => accepted && linkUp;
 }
 
 class PersonalMessage {

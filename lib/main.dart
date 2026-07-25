@@ -126,10 +126,8 @@ class _ResQShellState extends State<ResQShell> {
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => SensorSheet(
-        location: _location,
-        deviceSensors: _deviceSensors,
-      ),
+      builder: (_) =>
+          SensorSheet(location: _location, deviceSensors: _deviceSensors),
     );
   }
 
@@ -159,7 +157,9 @@ class _ResQShellState extends State<ResQShell> {
               if (!sent) {
                 ScaffoldMessenger.of(context).showSnackBar(
                   const SnackBar(
-                    content: Text('Start the mesh first in the People tab before sending an SOS.'),
+                    content: Text(
+                      'Start the mesh first in the People tab before sending an SOS.',
+                    ),
                   ),
                 );
               }
@@ -343,8 +343,9 @@ class HomeScreen extends StatelessWidget {
                             initialData: mesh.currentPeers,
                             builder: (context, snapshot) {
                               final peers = snapshot.data ?? [];
-                              final connected =
-                                  peers.where((p) => p.connected).length;
+                              final connected = peers
+                                  .where((p) => p.connected)
+                                  .length;
                               return HeroMetric(
                                 icon: Icons.bluetooth_connected_rounded,
                                 label: connected > 0
@@ -506,8 +507,7 @@ class HomeScreen extends StatelessWidget {
                         if (gpsStatus == GpsStatus.loading) {
                           gpsTitle = 'GPS ...';
                           gpsDetail = 'Acquiring position';
-                        } else if (gpsStatus ==
-                            GpsStatus.permissionDenied) {
+                        } else if (gpsStatus == GpsStatus.permissionDenied) {
                           gpsTitle = 'GPS permission denied';
                           gpsDetail = 'Enable in Settings';
                         } else if (gpsStatus == GpsStatus.unavailable) {
@@ -519,10 +519,8 @@ class HomeScreen extends StatelessWidget {
                         } else {
                           final pos = location.position;
                           if (pos != null) {
-                            final lat =
-                                pos.latitude.toStringAsFixed(4);
-                            final lng =
-                                pos.longitude.toStringAsFixed(4);
+                            final lat = pos.latitude.toStringAsFixed(4);
+                            final lng = pos.longitude.toStringAsFixed(4);
                             gpsTitle = '$lat, $lng';
                             final acc = pos.accuracy;
                             gpsDetail = acc > 0
@@ -543,8 +541,8 @@ class HomeScreen extends StatelessWidget {
                                   icon: Icons.group_outlined,
                                   title: isMeshRunning
                                       ? (contacts.isNotEmpty
-                                          ? contacts.first.name
-                                          : 'Your mesh')
+                                            ? contacts.first.name
+                                            : 'Your mesh')
                                       : 'Mesh offline',
                                   detail: isMeshRunning
                                       ? '${contacts.length} contacts, $peerCount nearby'
@@ -592,10 +590,7 @@ class HomeScreen extends StatelessWidget {
 }
 
 class AssistantScreen extends StatefulWidget {
-  const AssistantScreen({
-    required this.model,
-    super.key,
-  });
+  const AssistantScreen({required this.model, super.key});
 
   final ModelStore model;
 
@@ -658,9 +653,9 @@ class _AssistantScreenState extends State<AssistantScreen>
         );
       } catch (error) {
         if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to load model: $error')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Failed to load model: $error')));
       }
     }
   }
@@ -693,8 +688,7 @@ class _AssistantScreenState extends State<AssistantScreen>
         _isGenerating = false;
         _messages.add(
           const _ChatMessage(
-            content:
-                'Tap the model chip above to load the local model first.',
+            content: 'Tap the model chip above to load the local model first.',
             isAssistant: true,
           ),
         );
@@ -793,7 +787,11 @@ class _AssistantScreenState extends State<AssistantScreen>
                       Expanded(
                         child: Text(
                           'Offline assistant',
-                          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: Color(0xFF68736D)),
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 13,
+                            color: Color(0xFF68736D),
+                          ),
                         ),
                       ),
                     ],
@@ -807,7 +805,7 @@ class _AssistantScreenState extends State<AssistantScreen>
                   borderRadius: BorderRadius.circular(18),
                   onTap: _toggleModel,
                   child: Ink(
-      padding: const EdgeInsets.all(12),
+                    padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
                       color: widget.model.isBusy
                           ? const Color(0xFFE8E7E0)
@@ -888,7 +886,8 @@ class _AssistantScreenState extends State<AssistantScreen>
                       );
                     }
                     final message = _messages[index - 1];
-                    final isThinking = _isThinking && index - 1 == _messages.length - 1;
+                    final isThinking =
+                        _isThinking && index - 1 == _messages.length - 1;
                     return Align(
                       alignment: message.isAssistant
                           ? Alignment.centerLeft
@@ -1032,6 +1031,11 @@ class _PeopleScreenState extends State<PeopleScreen> {
       if (!mounted) return;
       setState(() => _btOff = true);
       return;
+    } on Object catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Bluetooth mesh could not start: $error')),
+      );
     }
   }
 
@@ -1063,7 +1067,9 @@ class _PeopleScreenState extends State<PeopleScreen> {
             ],
           ),
         );
-        if (accepted != null) await widget.mesh.respondToRequest(contact, accepted);
+        if (accepted != null) {
+          await widget.mesh.respondToRequest(contact, accepted);
+        }
         return;
       case ConnectionStatus.connected:
         if (!mounted) return;
@@ -1257,10 +1263,7 @@ class _PeopleScreenState extends State<PeopleScreen> {
 }
 
 class LibraryScreen extends StatefulWidget {
-  const LibraryScreen({
-    required this.model,
-    super.key,
-  });
+  const LibraryScreen({required this.model, super.key});
 
   final ModelStore model;
 
@@ -1284,9 +1287,9 @@ class _LibraryScreenState extends State<LibraryScreen> {
       );
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not import model: $error')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not import model: $error')));
     }
   }
 
@@ -1377,9 +1380,7 @@ class _LibraryScreenState extends State<LibraryScreen> {
                       ),
                     ),
                     TextButton(
-                      onPressed: widget.model.isBusy
-                          ? null
-                          : _importModel,
+                      onPressed: widget.model.isBusy ? null : _importModel,
                       child: Text(widget.model.hasModel ? 'Replace' : 'Import'),
                     ),
                   ],
@@ -1467,16 +1468,16 @@ class SensorSheet extends StatelessWidget {
             ListenableBuilder(
               listenable: deviceSensors,
               builder: (context, _) {
-                final heading = deviceSensors.compassStatus ==
-                        SensorStatus.available
+                final heading =
+                    deviceSensors.compassStatus == SensorStatus.available
                     ? deviceSensors.heading
                     : null;
                 final dir = deviceSensors.cardinalDirection;
                 final degrees = heading != null
                     ? '${heading.toStringAsFixed(0)} degrees'
                     : deviceSensors.compassStatus == SensorStatus.loading
-                        ? 'Compass initializing...'
-                        : 'Compass unavailable';
+                    ? 'Compass initializing...'
+                    : 'Compass unavailable';
                 return Container(
                   height: 155,
                   decoration: BoxDecoration(
@@ -1547,11 +1548,11 @@ class SensorSheet extends StatelessWidget {
                 if (locStatus == GpsStatus.loading) {
                   speedValue = 'Loading...';
                 } else if (locStatus != GpsStatus.available ||
-                    speed == null || speed < 0) {
+                    speed == null ||
+                    speed < 0) {
                   speedValue = 'Unavailable';
                 } else {
-                  speedValue =
-                      '${(speed * 3.6).toStringAsFixed(1)} km/h';
+                  speedValue = '${(speed * 3.6).toStringAsFixed(1)} km/h';
                 }
 
                 String latLngValue;
@@ -1605,8 +1606,8 @@ class SensorSheet extends StatelessWidget {
             ListenableBuilder(
               listenable: deviceSensors,
               builder: (context, _) {
-                final isAvailable = deviceSensors.flashlightStatus ==
-                    SensorStatus.available;
+                final isAvailable =
+                    deviceSensors.flashlightStatus == SensorStatus.available;
                 final isOn = deviceSensors.isFlashlightOn;
                 return Card(
                   child: ListTile(
@@ -1810,7 +1811,11 @@ class _ThinkingDots extends StatelessWidget {
       builder: (context, _) {
         final phase = (animation.value * 3).floor();
         return Text(
-          phase == 0 ? '.' : phase == 1 ? '..' : '...',
+          phase == 0
+              ? '.'
+              : phase == 1
+              ? '..'
+              : '...',
           style: const TextStyle(
             color: Color(0xFF68736D),
             fontSize: 28,
@@ -1924,7 +1929,10 @@ class SensorMetric extends StatelessWidget {
             fit: BoxFit.scaleDown,
             child: Text(
               value,
-              style: TextStyle(fontWeight: FontWeight.w800, fontSize: valueFontSize),
+              style: TextStyle(
+                fontWeight: FontWeight.w800,
+                fontSize: valueFontSize,
+              ),
             ),
           ),
           Text(
