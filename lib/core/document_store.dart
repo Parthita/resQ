@@ -1,10 +1,10 @@
 import 'dart:async';
 
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 
 import 'document_indexer.dart';
 import 'local_document_repository.dart';
+import 'local_file_picker.dart';
 import 'offline_contracts.dart';
 
 class DocumentStore extends ChangeNotifier {
@@ -42,24 +42,14 @@ class DocumentStore extends ChangeNotifier {
   }
 
   Future<LocalDocument?> pickAndImportPdf() async {
-    final result = await FilePicker.pickFiles(
-      type: FileType.custom,
-      allowedExtensions: const ['pdf'],
-      withData: false,
+    final path = await LocalFilePicker.pickSingle(
+      extensions: const ['pdf'],
     );
-    if (result == null) return null;
-
-    final selectedFile = result.files.single;
-    final path = selectedFile.path;
-    if (path == null) {
-      throw const DocumentStorageException(
-        'This device did not provide access to the selected PDF.',
-      );
-    }
+    if (path == null) return null;
 
     final document = await _repository.importPdf(
       sourcePath: path,
-      displayName: selectedFile.name,
+      displayName: path.split('/').last,
     );
     final indexingDocument = document.copyWith(
       indexState: DocumentIndexState.indexing,

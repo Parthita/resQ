@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 
 import 'core/document_store.dart';
 import 'core/local_document_repository.dart';
+import 'core/local_llm_service.dart';
+import 'core/model_store.dart';
 import 'core/offline_contracts.dart';
 
 void main() {
@@ -21,11 +23,14 @@ class ResQApp extends StatefulWidget {
 
 class _ResQAppState extends State<ResQApp> {
   late final DocumentStore _documents;
+  late final ModelStore _model;
 
   @override
   void initState() {
     super.initState();
     _documents = DocumentStore();
+    _model = ModelStore();
+    unawaited(_model.refresh());
     if (widget.loadDocuments) {
       unawaited(_documents.load());
     }
@@ -80,15 +85,16 @@ class _ResQAppState extends State<ResQApp> {
           ),
         ),
       ),
-      home: ResQShell(documents: _documents),
+      home: ResQShell(documents: _documents, model: _model),
     );
   }
 }
 
 class ResQShell extends StatefulWidget {
-  const ResQShell({required this.documents, super.key});
+  const ResQShell({required this.documents, required this.model, super.key});
 
   final DocumentStore documents;
+  final ModelStore model;
 
   @override
   State<ResQShell> createState() => _ResQShellState();
@@ -151,9 +157,9 @@ class _ResQShellState extends State<ResQShell> {
         onSensors: _openSensors,
         onSos: _openSos,
       ),
-      AssistantScreen(documents: widget.documents),
+      AssistantScreen(documents: widget.documents, model: widget.model),
       const PeopleScreen(),
-      LibraryScreen(documents: widget.documents),
+      LibraryScreen(documents: widget.documents, model: widget.model),
     ];
 
     return Scaffold(
@@ -432,9 +438,14 @@ class HomeScreen extends StatelessWidget {
 }
 
 class AssistantScreen extends StatefulWidget {
-  const AssistantScreen({required this.documents, super.key});
+  const AssistantScreen({
+    required this.documents,
+    required this.model,
+    super.key,
+  });
 
   final DocumentStore documents;
+  final ModelStore model;
 
   @override
   State<AssistantScreen> createState() => _AssistantScreenState();
@@ -450,7 +461,7 @@ class _AssistantScreenState extends State<AssistantScreen> {
     ),
   ];
   String? _selectedDocumentId;
-  bool _isSearching = false;
+  bool _isGenerating = false;
 
   @override
   void dispose() {
@@ -537,15 +548,16 @@ class _AssistantScreenState extends State<AssistantScreen> {
     setState(() {
       _messages.add(_ChatMessage(content: text, isAssistant: false));
       _controller.clear();
-      _isSearching = document != null;
+      _isGenerating = true;
     });
 
-    if (document == null) {
+    if (!widget.model.isReady) {
       setState(() {
+        _isGenerating = false;
         _messages.add(
           const _ChatMessage(
             content:
-                'Choose an imported PDF to search your local documents. The on-device language model is the next integration for general answers.',
+                'Import a GGUF model from Library before asking the offline assistant.',
             isAssistant: true,
           ),
         );
@@ -553,33 +565,68 @@ class _AssistantScreenState extends State<AssistantScreen> {
       return;
     }
 
-    if (document.indexState != DocumentIndexState.ready) {
+    List<DocumentSearchHit> hits = const [];
+    if (document != null) {
+      if (document.indexState != DocumentIndexState.ready) {
+        setState(() {
+          _isGenerating = false;
+          _messages.add(
+            _ChatMessage(content: _indexMessage(document), isAssistant: true),
+          );
+        });
+        return;
+      }
+      hits = await widget.documents.search(document, text);
+      if (!mounted) return;
+    }
+
+    if (document != null && hits.isEmpty) {
       setState(() {
-        _isSearching = false;
+        _isGenerating = false;
         _messages.add(
-          _ChatMessage(content: _indexMessage(document), isAssistant: true),
+          _ChatMessage(
+            content:
+                'I could not find relevant text in ${document.name}. Try a more specific question or switch to general assistant.',
+            isAssistant: true,
+          ),
         );
       });
       return;
     }
 
-    final hits = await widget.documents.search(document, text);
-    if (!mounted) return;
     setState(() {
-      _isSearching = false;
-      _messages.add(
-        _ChatMessage(
-          content: _searchResponse(document, hits),
-          isAssistant: true,
-        ),
-      );
+      _messages.add(const _ChatMessage(content: '', isAssistant: true));
     });
+
+    try {
+      await for (final token in widget.model.generate(
+        prompt: document == null
+            ? _generalPrompt(text)
+            : _groundedPrompt(question: text, hits: hits),
+      )) {
+        if (!mounted) return;
+        setState(() {
+          final last = _messages.removeLast();
+          _messages.add(last.copyWith(content: '${last.content}$token'));
+        });
+      }
+    } on LocalModelException catch (error) {
+      if (!mounted) return;
+      setState(() {
+        final last = _messages.removeLast();
+        _messages.add(
+          last.copyWith(content: 'Local model error: ${error.message}'),
+        );
+      });
+    } finally {
+      if (mounted) setState(() => _isGenerating = false);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: widget.documents,
+      animation: Listenable.merge([widget.documents, widget.model]),
       builder: (context, _) {
         final selectedDocument = _selectedDocument;
         return SafeArea(
@@ -735,8 +782,8 @@ class _AssistantScreenState extends State<AssistantScreen> {
                     ),
                     const SizedBox(width: 8),
                     IconButton.filled(
-                      onPressed: _isSearching ? null : _send,
-                      icon: _isSearching
+                      onPressed: _isGenerating ? null : _send,
+                      icon: _isGenerating
                           ? const SizedBox(
                               width: 18,
                               height: 18,
@@ -934,9 +981,14 @@ class PeopleScreen extends StatelessWidget {
 }
 
 class LibraryScreen extends StatelessWidget {
-  const LibraryScreen({required this.documents, super.key});
+  const LibraryScreen({
+    required this.documents,
+    required this.model,
+    super.key,
+  });
 
   final DocumentStore documents;
+  final ModelStore model;
 
   Future<void> _importDocument(BuildContext context) async {
     try {
@@ -951,6 +1003,29 @@ class LibraryScreen extends StatelessWidget {
         ScaffoldMessenger.of(
           context,
         ).showSnackBar(SnackBar(content: Text(error.message)));
+      }
+    }
+  }
+
+  Future<void> _importModel(BuildContext context) async {
+    try {
+      await model.importAndLoad();
+      if (!context.mounted) return;
+      final status = model.status;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            status.isLoaded
+                ? 'Local model loaded. Assistant answers now run on this phone.'
+                : 'Model import was cancelled.',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not load local model: $error')),
+        );
       }
     }
   }
@@ -991,7 +1066,7 @@ class LibraryScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: documents,
+      animation: Listenable.merge([documents, model]),
       builder: (context, _) => SafeArea(
         child: ListView(
           padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
@@ -1076,6 +1151,62 @@ class LibraryScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 10),
               ],
+            const SizedBox(height: 28),
+            const SectionTitle(title: 'Local model'),
+            const SizedBox(height: 10),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    Container(
+                      width: 46,
+                      height: 46,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFE2F0E4),
+                        borderRadius: BorderRadius.circular(15),
+                      ),
+                      child: const Icon(
+                        Icons.memory_rounded,
+                        color: Color(0xFF2A5D4A),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            model.isReady
+                                ? 'GGUF model loaded'
+                                : 'No GGUF model loaded',
+                            style: const TextStyle(fontWeight: FontWeight.w800),
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            model.isBusy
+                                ? 'Copying and preparing the model'
+                                : model.status.hasModel
+                                ? '${_formatBytes(model.status.sizeBytes)} stored privately'
+                                : 'Import a small quantized GGUF model',
+                            style: const TextStyle(
+                              color: Color(0xFF68736D),
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: model.isBusy
+                          ? null
+                          : () => _importModel(context),
+                      child: Text(model.status.hasModel ? 'Replace' : 'Import'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
             const SizedBox(height: 28),
             const SectionTitle(title: 'Observations'),
             const SizedBox(height: 10),
@@ -1583,6 +1714,13 @@ class _ChatMessage {
   const _ChatMessage({required this.content, required this.isAssistant});
   final String content;
   final bool isAssistant;
+
+  _ChatMessage copyWith({String? content}) {
+    return _ChatMessage(
+      content: content ?? this.content,
+      isAssistant: isAssistant,
+    );
+  }
 }
 
 String _documentStatus(LocalDocument document) {
@@ -1608,21 +1746,27 @@ String _indexMessage(LocalDocument document) {
   };
 }
 
-String _searchResponse(LocalDocument document, List<DocumentSearchHit> hits) {
-  if (hits.isEmpty) {
-    return 'I could not find a matching section in ${document.name}. Try different words from the document or choose another guide.';
-  }
+String _generalPrompt(String question) => '''
+Answer the following question as a helpful offline assistant. Be concise and clear.
 
-  final results = hits
-      .map((hit) {
-        final compactText = hit.section.text.replaceAll(RegExp(r'\s+'), ' ');
-        final preview = compactText.length > 220
-            ? '${compactText.substring(0, 220)}...'
-            : compactText;
-        return 'Page ${hit.section.pageNumber}: $preview';
-      })
+Question: $question
+''';
+
+String _groundedPrompt({
+  required String question,
+  required List<DocumentSearchHit> hits,
+}) {
+  final context = hits
+      .map((hit) => '[Page ${hit.section.pageNumber}]\n${hit.section.text}')
       .join('\n\n');
-  return 'Found ${hits.length} relevant ${hits.length == 1 ? 'section' : 'sections'} in ${document.name}:\n\n$results';
+  return '''
+Retrieved document context:
+$context
+
+Question: $question
+
+Answer only from the retrieved context. Cite supporting pages in square brackets, such as [Page 4]. If the context is insufficient, say so clearly.
+''';
 }
 
 String _formatBytes(int byteCount) {

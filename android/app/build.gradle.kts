@@ -19,10 +19,32 @@ android {
         applicationId = "com.resq.app.resq"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // llama.cpp's Android runtime uses logging APIs introduced in Android 11.
+        minSdk = 30
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+
+        externalNativeBuild {
+            cmake {
+                abiFilters += listOf("arm64-v8a")
+                arguments += listOf(
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DANDROID_PLATFORM=android-30",
+                    "-DLLAMA_BUILD_APP=OFF",
+                    "-DLLAMA_BUILD_COMMON=ON",
+                    "-DLLAMA_OPENSSL=OFF",
+                    "-DGGML_NATIVE=OFF",
+                    "-DGGML_BACKEND_DL=OFF",
+                    "-DGGML_CPU_ALL_VARIANTS=OFF",
+                    "-DGGML_LLAMAFILE=OFF",
+                )
+            }
+        }
     }
 
     buildTypes {
@@ -32,6 +54,23 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    sourceSets {
+        getByName("main").java.srcDir(
+            "src/main/cpp/llama.cpp/examples/llama.android/lib/src/main/java",
+        )
+    }
+}
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
 }
 
 kotlin {
