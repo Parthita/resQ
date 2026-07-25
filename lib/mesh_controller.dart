@@ -59,9 +59,6 @@ class MeshController {
   /// Current connection count for widgets that mount late.
   int get connectedCount => _peers.where((p) => p.connected).length;
 
-  /// Stream of mesh lifecycle state changes (for widgets that need to react).
-  Stream<MeshState> get stateStream => _stateController.stream;
-
   void _ensureLink() {
     _link ??= _preferredLink ?? BleLink(useMainnet: useMainnet);
   }

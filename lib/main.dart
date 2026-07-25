@@ -868,6 +868,9 @@ class _PeopleScreenState extends State<PeopleScreen> {
           MeshState.running => 'Mesh active — discovering peers',
           MeshState.stopping => 'Stopping mesh…',
         };
+        // seed from the current snapshot so a re-mounted screen shows peers
+        // already discovered before this widget existed
+        if (s == MeshState.running) _peerList = _mesh.currentPeers;
       });
     });
     _mesh.peersStream.listen((peers) {
