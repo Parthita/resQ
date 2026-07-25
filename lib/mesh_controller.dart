@@ -1,12 +1,17 @@
 import 'dart:async';
-
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'core/bitchat/bitchat_link.dart';
 import 'core/bitchat/ble_link.dart';
 import 'core/bitchat/flood_router.dart';
 import 'core/bitchat/identity_service.dart';
+import 'core/bitchat/bitchat_packet.dart';
+import 'core/bitchat/message_type.dart';
 import 'core/bitchat/sync_doc_tunnel.dart';
+import 'core/bitchat/tlv_announce.dart';
 
 /// High-level controller that turns on the BitChat-style mesh for resQ.
 ///
@@ -22,7 +27,7 @@ import 'core/bitchat/sync_doc_tunnel.dart';
 /// The UI layer just calls start()/stop() and listens to [state] / [peers].
 class MeshController {
   MeshController({BitchatLink? link, this.useMainnet = false})
-      : _preferredLink = link;
+    : _preferredLink = link;
 
   final bool useMainnet;
   final BitchatLink? _preferredLink;
@@ -72,6 +77,24 @@ class MeshController {
   Stream<List<MeshPeer>> get peersStream => _peerController.stream;
 
   final List<MeshPeer> _peers = [];
+  final Map<String, PersonalContact> _contacts = {};
+  final Map<String, List<PersonalMessage>> _messages = {};
+  final _contactsController =
+      StreamController<List<PersonalContact>>.broadcast();
+  final _messagesController = StreamController<PersonalMessage>.broadcast();
+  StreamSubscription<LinkPeer>? _peerSubscription;
+  StreamSubscription<BitchatPacket>? _packetSubscription;
+  Timer? _presenceTimer;
+
+  /// People discovered by the resQ protocol (not merely by a BLE scan).
+  /// A contact cannot be messaged until they accept a connection request.
+  List<PersonalContact> get contacts =>
+      _contacts.values.toList()..sort((a, b) => a.name.compareTo(b.name));
+  Stream<List<PersonalContact>> get contactsStream =>
+      _contactsController.stream;
+  Stream<PersonalMessage> get messagesStream => _messagesController.stream;
+  List<PersonalMessage> messagesFor(String contactId) =>
+      List.unmodifiable(_messages[contactId] ?? const []);
 
   /// Request BLE permissions AND verify the Bluetooth adapter is on.
   /// Returns a [MeshPermissionResult] so the UI can tell the user exactly what
@@ -91,44 +114,101 @@ class MeshController {
       return MeshPermissionResult(ok: false, reason: 'permissions');
     }
 
-    if (!_link!.isPoweredOn) {
-      return MeshPermissionResult(ok: false, reason: 'bluetooth_off');
+    // Android 11 and below require location permission for BLE scanning even
+    // though Bluetooth itself is already granted. Android 12+ uses the three
+    // nearby-devices permissions above and should not be blocked on location.
+    if (await _needsLegacyScanLocation()) {
+      final location = await Permission.locationWhenInUse.request();
+      if (!location.isGranted) {
+        return MeshPermissionResult(ok: false, reason: 'location');
+      }
     }
 
+    // A freshly-created native manager starts in `unknown` on many Android
+    // phones and reports its real adapter state a moment later.  Do not reject
+    // a valid scan here; BleLink.start waits for that authoritative callback.
     return MeshPermissionResult(ok: true);
   }
 
+  static const _platformChannel = MethodChannel('resq.platform');
+
+  static Future<bool> _needsLegacyScanLocation() async {
+    try {
+      final sdk = await _platformChannel.invokeMethod<int>('androidSdk');
+      return sdk != null && sdk <= 30;
+    } on MissingPluginException {
+      // Tests and non-Android platforms do not expose this channel and do not
+      // require Android's legacy location permission for BLE scanning.
+      return false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   Future<void> start() async {
+    debugPrint('[resq:mesh] start requested');
     _setState(MeshState.starting);
     _ensureLink();
 
     try {
       identity = await MeshIdentity.generate();
+      debugPrint('[resq:mesh] identity ready id=${_hex(identity.senderId)}');
       router = FloodRouter(link: _link!, chunkSize: 469);
       tunnel = SyncDocTunnel(router: router, senderId: identity.senderId);
 
       // surface real BLE discoveries to the UI peer list
-      _link!.peers.listen(_onLinkPeer);
+      await _peerSubscription?.cancel();
+      _peerSubscription = _link!.peers.listen(_onLinkPeer);
 
       // We verify peer signatures using their announced Ed25519 key. For now
       // the router has no verifier wired (open mesh); the SyncDocTunnel still
       // applies CRDT updates. To enforce identity, pass a verifier built from a
       // learned key table (populated from announce TLV 0x03).
       await tunnel.start();
+      await _packetSubscription?.cancel();
+      _packetSubscription = router.delivered.listen(_onPacket);
+      // Mark running before announcing. A BLE connection can complete while
+      // startup is in progress; its callback must be able to send a presence
+      // packet immediately rather than dropping it as "not started".
+      _setState(MeshState.running);
+      debugPrint('[resq:mesh] transport running; sending initial announce');
+      await _announce();
+      // A GATT link and its notify subscription often become ready after the
+      // first announcement. Repeat presence briefly/cheaply while scanning so
+      // a physical resQ advertiser reliably becomes a visible app peer.
+      _presenceTimer?.cancel();
+      _presenceTimer = Timer.periodic(
+        const Duration(seconds: 2),
+        (_) => unawaited(_announce()),
+      );
     } on BluetoothOffException {
       // Adapter is off — drop back to stopped and let the UI show the hint.
       _setState(MeshState.stopped);
+      debugPrint('[resq:mesh] start aborted: bluetooth off');
+      rethrow;
+    } on Object catch (e, st) {
+      // Any other BLE/startup failure (e.g. GATT addService-on-readvertise,
+      // advertising rejected) must NOT leave us stuck in 'starting' or crash
+      // the caller. Tear down and report.
+      debugPrint('[mesh] start failed: $e\n$st');
+      await stop();
       rethrow;
     }
-
-    _setState(MeshState.running);
   }
 
   void _onLinkPeer(LinkPeer p) {
+    debugPrint(
+      '[resq:mesh] BLE peer id=${p.id} name=${p.name ?? '-'} '
+      'connected=${p.connected}',
+    );
     final idx = _peers.indexWhere((e) => e.id == p.id);
+    final previous = idx >= 0 ? _peers[idx] : null;
     final peer = MeshPeer(
       id: p.id,
-      nickname: p.name ?? p.id,
+      // Connection-state callbacks do not include an advertisement name; do
+      // not overwrite the useful discovery name with a random BLE UUID.
+      nickname: p.name ?? previous?.nickname ?? p.id,
+      identityHint: p.identityHint ?? previous?.identityHint,
       lastSeen: DateTime.now(),
       connected: p.connected,
     );
@@ -138,7 +218,261 @@ class MeshController {
       _peers.add(peer);
     }
     _peerController.add(List.of(_peers));
+    if (p.connected && isStarted) {
+      // Startup announcements commonly happen before GATT notification/write
+      // channels are ready. Repeat after each real link establishment so the
+      // other phone can become a visible resQ person.
+      unawaited(_announce());
+    }
+    // A physical link loss makes every personal conversation unavailable.
+    // We keep the accepted contact (rather than silently deleting it), but the
+    // UI immediately closes its composer and clearly shows it as disconnected.
+    if (!p.connected && !_peers.any((peer) => peer.connected)) {
+      var changed = false;
+      for (final contact in _contacts.values) {
+        if (contact.status == ConnectionStatus.connected) {
+          contact.status = ConnectionStatus.disconnected;
+          changed = true;
+        }
+      }
+      if (changed) _emitContacts();
+    }
   }
+
+  Future<void> _announce() async {
+    debugPrint('[resq:mesh] announce send id=$myIdHex');
+    final packet = BitchatPacket(
+      type: MessageType.announce.value,
+      senderId: identity.senderId,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: TlvAnnounce(
+        nickname: 'resQ',
+        noisePublicKey: identity.noisePublicKey,
+        signingPublicKey: identity.signingPublicKey,
+      ).encode(),
+      ttl: 1,
+    );
+    await router.broadcast(await identity.signPacket(packet));
+  }
+
+  /// The BLE scan runs continuously; this refreshes application presence for
+  /// an already-discovered link when the user taps Scan.
+  Future<void> refreshPresence() async {
+    if (isStarted) await _announce();
+  }
+
+  /// Ask a discovered person for a private conversation. This only creates an
+  /// outgoing pending state; it never marks either side connected on its own.
+  Future<void> requestConnection(PersonalContact contact) async {
+    if (!isStarted || contact.status == ConnectionStatus.connected) return;
+    contact.status = ConnectionStatus.outgoingPending;
+    debugPrint('[resq:mesh] request send to=${contact.id}');
+    _emitContacts();
+    await _sendEnvelope({
+      'kind': 'request',
+      'name': 'resQ',
+    }, recipient: contact.id);
+  }
+
+  /// Accept or reject an incoming request. Acceptance is the sole transition
+  /// to connected; rejection leaves no chat route open.
+  Future<void> respondToRequest(PersonalContact contact, bool accept) async {
+    if (contact.status != ConnectionStatus.incomingPending) return;
+    contact.status = accept
+        ? ConnectionStatus.connected
+        : ConnectionStatus.rejected;
+    debugPrint(
+      '[resq:mesh] request response to=${contact.id} accepted=$accept',
+    );
+    _emitContacts();
+    await _sendEnvelope({
+      'kind': 'response',
+      'accepted': accept,
+      'name': 'resQ',
+    }, recipient: contact.id);
+  }
+
+  Future<bool> sendPersonalMessage(PersonalContact contact, String text) async {
+    final clean = text.trim();
+    if (clean.isEmpty ||
+        contact.status != ConnectionStatus.connected ||
+        !isStarted) {
+      return false;
+    }
+    final message = PersonalMessage(
+      contactId: contact.id,
+      text: clean,
+      timestamp: DateTime.now(),
+      isMine: true,
+    );
+    (_messages[contact.id] ??= []).add(message);
+    _messagesController.add(message);
+    await _sendEnvelope({'kind': 'chat', 'text': clean}, recipient: contact.id);
+    return true;
+  }
+
+  Future<void> _onPacket(BitchatPacket packet) async {
+    if (!isStarted) return;
+    final mine = myIdHex;
+    final recipient = packet.recipientId == null
+        ? null
+        : _hex(packet.recipientId!);
+    if (recipient != null && recipient != mine) return;
+    try {
+      if (packet.type == MessageType.announce.value) {
+        final sender = _hex(packet.senderId);
+        debugPrint('[resq:mesh] announce received from=$sender');
+        if (sender == mine) return;
+        final announce = TlvAnnounce.decode(packet.payload);
+        if (announce.noisePublicKey.length != 32 ||
+            announce.signingPublicKey.length != 32 ||
+            _hex(await MeshIdentity.deriveSenderId(announce.noisePublicKey)) !=
+                sender ||
+            !await MeshIdentity.verifyPacket(
+              packet,
+              announce.signingPublicKey,
+            )) {
+          debugPrint(
+            '[resq:mesh] announce rejected from=$sender (identity/signature invalid)',
+          );
+          return;
+        }
+        final isNew = !_contacts.containsKey(sender);
+        final contact = _contacts.putIfAbsent(
+          sender,
+          () => PersonalContact(
+            id: sender,
+            name: announce.nickname.isEmpty ? 'Nearby resQ' : announce.nickname,
+          ),
+        );
+        if (announce.nickname.isNotEmpty) contact.name = announce.nickname;
+        contact.signingKey = announce.signingPublicKey;
+        debugPrint('[resq:mesh] announce verified from=$sender new=$isNew');
+        _bindRawPeerToIdentity(sender, contact.name);
+        _emitContacts();
+        if (isNew) unawaited(_announce());
+        return;
+      }
+      if (packet.type != MessageType.personal.value) return;
+      final body =
+          jsonDecode(utf8.decode(packet.payload)) as Map<String, dynamic>;
+      final sender = _hex(packet.senderId);
+      if (sender == mine) return;
+      final kind = body['kind'] as String?;
+      Uint8List? signingKey;
+      if (kind == 'announce') {
+        final noise = Uint8List.fromList(base64Decode(body['noise'] as String));
+        signingKey = Uint8List.fromList(
+          base64Decode(body['signing'] as String),
+        );
+        if (noise.length != 32 ||
+            signingKey.length != 32 ||
+            _hex(await MeshIdentity.deriveSenderId(noise)) != sender ||
+            !await MeshIdentity.verifyPacket(packet, signingKey)) {
+          return;
+        }
+      } else {
+        final known = _contacts[sender]?.signingKey;
+        if (known == null || !await MeshIdentity.verifyPacket(packet, known)) {
+          debugPrint(
+            '[resq:mesh] personal packet rejected from=$sender (unverified identity)',
+          );
+          return;
+        }
+      }
+      final isNewContact = !_contacts.containsKey(sender);
+      final contact = _contacts.putIfAbsent(
+        sender,
+        () => PersonalContact(
+          id: sender,
+          name: (body['name'] as String?) ?? 'Nearby resQ',
+        ),
+      );
+      final name = body['name'] as String?;
+      if (name != null && name.isNotEmpty) contact.name = name;
+      if (signingKey != null) contact.signingKey = signingKey;
+      switch (body['kind']) {
+        case 'announce':
+          // A peer might have started after our initial announcement. Reply
+          // once when first seen so both sides promptly learn each identity.
+          if (isNewContact) unawaited(_announce());
+          break;
+        case 'request':
+          if (contact.status != ConnectionStatus.connected) {
+            contact.status = ConnectionStatus.incomingPending;
+          }
+          debugPrint('[resq:mesh] request received from=$sender');
+          break;
+        case 'response':
+          contact.status = body['accepted'] == true
+              ? ConnectionStatus.connected
+              : ConnectionStatus.rejected;
+          debugPrint(
+            '[resq:mesh] request response received from=$sender accepted=${body['accepted'] == true}',
+          );
+          break;
+        case 'chat':
+          if (contact.status != ConnectionStatus.connected) return;
+          final text = body['text'] as String?;
+          if (text == null || text.trim().isEmpty) return;
+          final message = PersonalMessage(
+            contactId: sender,
+            text: text,
+            timestamp: DateTime.fromMillisecondsSinceEpoch(packet.timestamp),
+            isMine: false,
+          );
+          (_messages[sender] ??= []).add(message);
+          _messagesController.add(message);
+          break;
+      }
+      _emitContacts();
+    } on Object catch (error) {
+      // Ignore malformed or non-resQ envelopes rather than destabilising UI.
+      debugPrint('[resq:mesh] packet ignored: $error');
+    }
+  }
+
+  void _bindRawPeerToIdentity(String identity, String nickname) {
+    final candidates = _peers
+        .where((peer) => peer.connected && peer.identityHint == null)
+        .toList();
+    // A physical BLE UUID is only safely bound when there is one active
+    // unnamed link. With multiple links, leave it raw rather than guessing.
+    if (candidates.length != 1) return;
+    final index = _peers.indexOf(candidates.single);
+    final peer = candidates.single;
+    _peers[index] = MeshPeer(
+      id: peer.id,
+      nickname: nickname,
+      identityHint: identity,
+      lastSeen: peer.lastSeen,
+      connected: peer.connected,
+    );
+    _peerController.add(List.of(_peers));
+  }
+
+  Future<void> _sendEnvelope(
+    Map<String, dynamic> body, {
+    String? recipient,
+  }) async {
+    final packet = BitchatPacket(
+      type: MessageType.personal.value,
+      senderId: identity.senderId,
+      recipientId: recipient == null ? null : _idBytes(recipient),
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: Uint8List.fromList(utf8.encode(jsonEncode(body))),
+      ttl: 1,
+    );
+    await router.broadcast(await identity.signPacket(packet));
+  }
+
+  void _emitContacts() => _contactsController.add(contacts);
+  static String _hex(Uint8List id) =>
+      id.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  static Uint8List _idBytes(String hex) => Uint8List.fromList([
+    for (var i = 0; i < hex.length; i += 2)
+      int.parse(hex.substring(i, i + 2), radix: 16),
+  ]);
 
   /// Broadcast a small text note as a CRDT update over the mesh.
   Future<void> publishNote(String text) async {
@@ -154,10 +488,18 @@ class MeshController {
   Future<void> stop() async {
     if (_state == MeshState.stopped) return; // idempotent
     _setState(MeshState.stopping);
+    debugPrint('[resq:mesh] stopping');
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
     await tunnel.stop();
+    await _packetSubscription?.cancel();
+    _packetSubscription = null;
+    await _peerSubscription?.cancel();
+    _peerSubscription = null;
     _peers.clear();
     _peerController.add(const []);
     _setState(MeshState.stopped);
+    debugPrint('[resq:mesh] stopped');
     // Drop the BLE link so the next start() builds a fresh one (the old link's
     // GATT server/scan was torn down and its controllers closed).
     _link = null;
@@ -172,6 +514,8 @@ class MeshController {
     await _link?.dispose();
     await _stateController.close();
     await _peerController.close();
+    await _contactsController.close();
+    await _messagesController.close();
   }
 }
 
@@ -182,13 +526,49 @@ class MeshPeer {
     required this.id,
     required this.nickname,
     this.lastSeen,
+    this.identityHint,
     this.connected = false,
   });
 
   final String id;
   final String nickname;
   final DateTime? lastSeen;
+  final String? identityHint;
   final bool connected;
+}
+
+enum ConnectionStatus {
+  available,
+  outgoingPending,
+  incomingPending,
+  connected,
+  rejected,
+  disconnected,
+}
+
+class PersonalContact {
+  PersonalContact({
+    required this.id,
+    required this.name,
+    this.status = ConnectionStatus.available,
+  });
+  final String id;
+  String name;
+  ConnectionStatus status;
+  Uint8List? signingKey;
+}
+
+class PersonalMessage {
+  PersonalMessage({
+    required this.contactId,
+    required this.text,
+    required this.timestamp,
+    required this.isMine,
+  });
+  final String contactId;
+  final String text;
+  final DateTime timestamp;
+  final bool isMine;
 }
 
 /// Result of the runtime permission + adapter check.
@@ -196,6 +576,7 @@ class MeshPermissionResult {
   MeshPermissionResult({required this.ok, this.reason});
 
   final bool ok;
-  /// 'permissions' if BLE perms denied, 'bluetooth_off' if adapter is off.
+
+  /// 'permissions' if BLE perms denied, 'location' on Android 11 and below.
   final String? reason;
 }

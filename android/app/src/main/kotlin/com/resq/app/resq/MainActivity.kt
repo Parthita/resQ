@@ -1,6 +1,7 @@
 package com.resq.app.resq
 
 import android.content.Intent
+import android.os.Build
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -24,6 +25,14 @@ class MainActivity : FlutterActivity() {
         )
         localFilePickerChannel = LocalFilePickerChannel(this, filePicker)
         filePicker.setMethodCallHandler(localFilePickerChannel)
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "resq.platform",
+        ).setMethodCallHandler { call, result ->
+            if (call.method == "androidSdk") result.success(Build.VERSION.SDK_INT)
+            else result.notImplemented()
+        }
     }
 
     @Deprecated("Deprecated in Android")

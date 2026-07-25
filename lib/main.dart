@@ -8,8 +8,8 @@ import 'core/local_llm_service.dart';
 import 'core/model_store.dart';
 import 'core/offline_contracts.dart';
 import 'core/bitchat/ble_link.dart';
-import 'mesh_chat_screen.dart';
 import 'mesh_controller.dart';
+import 'personal_chat_screen.dart';
 
 void main() {
   runApp(const ResQApp());
@@ -260,10 +260,7 @@ class HomeScreen extends StatelessWidget {
                         ],
                       ),
                     ),
-                    StatusPill(
-                      label: 'OFFLINE',
-                      icon: Icons.cloud_off_rounded,
-                    ),
+                    StatusPill(label: 'OFFLINE', icon: Icons.cloud_off_rounded),
                   ],
                 ),
                 const SizedBox(height: 24),
@@ -808,41 +805,6 @@ class _AssistantScreenState extends State<AssistantScreen> {
 class PeopleScreen extends StatefulWidget {
   const PeopleScreen({super.key});
 
-  void _showPairing(BuildContext context, String device) {
-    showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        icon: const Icon(Icons.shield_outlined, size: 36),
-        title: Text('Verify $device'),
-        content: const Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text('Make sure both phones show the same code before connecting.'),
-            SizedBox(height: 20),
-            Text(
-              '482 391',
-              style: TextStyle(
-                fontSize: 28,
-                fontWeight: FontWeight.w800,
-                letterSpacing: 3,
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Not now'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Codes match'),
-          ),
-        ],
-      ),
-    );
-  }
-
   @override
   State<PeopleScreen> createState() => _PeopleScreenState();
 }
@@ -852,6 +814,7 @@ class _PeopleScreenState extends State<PeopleScreen> {
   MeshState _state = MeshState.stopped;
   String _statusText = 'Mesh is off';
   bool _permDenied = false;
+  bool _locationDenied = false;
   bool _btOff = false;
   List<MeshPeer> _peerList = const [];
 
@@ -868,14 +831,10 @@ class _PeopleScreenState extends State<PeopleScreen> {
           MeshState.running => 'Mesh active — discovering peers',
           MeshState.stopping => 'Stopping mesh…',
         };
-        // seed from the current snapshot so a re-mounted screen shows peers
-        // already discovered before this widget existed
-        if (s == MeshState.running) _peerList = _mesh.currentPeers;
       });
     });
     _mesh.peersStream.listen((peers) {
-      if (!mounted) return;
-      setState(() => _peerList = peers);
+      if (mounted) setState(() => _peerList = peers);
     });
   }
 
@@ -890,12 +849,15 @@ class _PeopleScreenState extends State<PeopleScreen> {
     if (!result.ok) {
       setState(() {
         _permDenied = result.reason == 'permissions';
+        _locationDenied = result.reason == 'location';
+        _permDenied = _permDenied || _locationDenied;
         _btOff = result.reason == 'bluetooth_off';
       });
       return;
     }
     setState(() {
       _permDenied = false;
+      _locationDenied = false;
       _btOff = false;
     });
     // 2) start BLE + flood router + CRDT tunnel
@@ -906,12 +868,50 @@ class _PeopleScreenState extends State<PeopleScreen> {
       setState(() => _btOff = true);
       return;
     }
-    // 3) publish our presence as a CRDT note so the peer mesh converges
-    final myHex = _mesh.identity.senderId
-        .map((e) => e.toRadixString(16).padLeft(2, '0'))
-        .join();
-    await _mesh.tunnel.setPresence(myHex, 'resQ');
-    await _mesh.publishNote('peer:$myHex\n');
+  }
+
+  Future<void> _handleContact(PersonalContact contact) async {
+    switch (contact.status) {
+      case ConnectionStatus.available:
+      case ConnectionStatus.rejected:
+      case ConnectionStatus.disconnected:
+        await _mesh.requestConnection(contact);
+        return;
+      case ConnectionStatus.incomingPending:
+        if (!mounted) return;
+        final accepted = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text('${contact.name} wants to connect'),
+            content: const Text(
+              'Accept to open a private nearby conversation.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context, false),
+                child: const Text('Reject'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(context, true),
+                child: const Text('Accept'),
+              ),
+            ],
+          ),
+        );
+        if (accepted != null) await _mesh.respondToRequest(contact, accepted);
+        return;
+      case ConnectionStatus.connected:
+        if (!mounted) return;
+        Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) =>
+                PersonalChatScreen(controller: _mesh, contact: contact),
+          ),
+        );
+        return;
+      case ConnectionStatus.outgoingPending:
+        break;
+    }
   }
 
   @override
@@ -924,8 +924,9 @@ class _PeopleScreenState extends State<PeopleScreen> {
   Widget build(BuildContext context) {
     final isOn = _state == MeshState.running;
     final statusLabel = isOn ? 'VISIBLE' : 'OFFLINE';
-    final statusIcon =
-        isOn ? Icons.visibility_outlined : Icons.visibility_off_outlined;
+    final statusIcon = isOn
+        ? Icons.visibility_outlined
+        : Icons.visibility_off_outlined;
     return SafeArea(
       child: ListView(
         padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
@@ -952,10 +953,7 @@ class _PeopleScreenState extends State<PeopleScreen> {
                   ],
                 ),
               ),
-              StatusPill(
-                label: statusLabel,
-                icon: statusIcon,
-              ),
+              StatusPill(label: statusLabel, icon: statusIcon),
             ],
           ),
           const SizedBox(height: 24),
@@ -989,9 +987,11 @@ class _PeopleScreenState extends State<PeopleScreen> {
                         Text(
                           _btOff
                               ? 'Bluetooth is off. Turn it on, then tap play again.'
+                              : _locationDenied
+                              ? 'Location permission is required to scan on Android 11 and older.'
                               : _permDenied
-                                  ? 'Bluetooth permission denied. Enable it in Settings.'
-                                  : 'Uses BLE to find nearby resQ phones and sync offline.',
+                              ? 'Bluetooth permission denied. Enable it in Settings.'
+                              : 'Uses BLE to find nearby resQ phones and sync offline.',
                           style: const TextStyle(
                             color: Color(0xFFC4E3CC),
                             height: 1.3,
@@ -1014,81 +1014,92 @@ class _PeopleScreenState extends State<PeopleScreen> {
             ),
           ),
           const SizedBox(height: 24),
-          FilledButton.icon(
-            onPressed: () {
-              Navigator.of(context).push(
-                MaterialPageRoute(
-                  builder: (_) => MeshChatScreen(controller: _mesh),
-                ),
-              );
+          const SizedBox(height: 28),
+          SectionTitle(
+            title: 'Nearby people',
+            action: 'Scan',
+            onAction: () => _mesh.refreshPresence(),
+          ),
+          const SizedBox(height: 10),
+          StreamBuilder<List<PersonalContact>>(
+            stream: _mesh.contactsStream,
+            initialData: _mesh.contacts,
+            builder: (context, snapshot) {
+              final contacts = snapshot.data ?? const [];
+              final identified = contacts.map((contact) => contact.id).toSet();
+              final rawPeers = _peerList
+                  .where(
+                    (peer) =>
+                        peer.identityHint == null ||
+                        !identified.contains(peer.identityHint),
+                  )
+                  .toList();
+              if (contacts.isNotEmpty || rawPeers.isNotEmpty) {
+                return Column(
+                  children: [
+                    ...rawPeers.map(
+                      (peer) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: NearbyDevice(
+                          name: peer.nickname,
+                          detail: peer.connected
+                              ? 'Connected • verifying identity…'
+                              : 'resQ device detected • connecting…',
+                          onConnect: () => _mesh.refreshPresence(),
+                          actionLabel: 'Refresh',
+                        ),
+                      ),
+                    ),
+                    ...contacts.map(
+                      (contact) => Padding(
+                        padding: const EdgeInsets.only(bottom: 10),
+                        child: NearbyDevice(
+                          name: contact.name,
+                          detail: _contactDetail(contact.status),
+                          onConnect: () => _handleContact(contact),
+                          actionLabel:
+                              contact.status == ConnectionStatus.connected
+                              ? 'Chat'
+                              : 'Connect',
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              }
+              return _nearbyEmpty();
             },
-            icon: const Icon(Icons.forum_outlined),
-            label: const Text('Open mesh chat'),
           ),
           const SizedBox(height: 28),
-          SectionTitle(title: 'Nearby devices', action: 'Scan'),
-          const SizedBox(height: 10),
-          if (_peerList.isEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(4, 8, 4, 8),
-              child: Text(
-                _state == MeshState.running
-                    ? 'Scanning… no resQ devices in range yet.'
-                    : 'Turn the mesh on to discover nearby resQ devices.',
-                style: TextStyle(color: Color(0xFF68736D), height: 1.3),
-              ),
-            )
-          else
-            ..._peerList.map(
-              (p) => Padding(
-                padding: const EdgeInsets.only(bottom: 10),
-                child: NearbyDevice(
-                  name: p.nickname,
-                  detail: p.lastSeen != null
-                      ? '${p.connected ? 'Connected' : 'Seen now'} | BLE'
-                      : 'BLE',
-                  onConnect: () => widget._showPairing(context, p.nickname),
-                ),
-              ),
-            ),
-          const SizedBox(height: 28),
-          SectionTitle(title: 'Your groups', action: 'Create'),
-          const SizedBox(height: 10),
-          Card(
-            child: ListTile(
-              contentPadding: const EdgeInsets.all(16),
-              leading: Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  color: const Color(0xFFE2F0E4),
-                  borderRadius: BorderRadius.circular(15),
-                ),
-                child: const Icon(
-                  Icons.hiking_rounded,
-                  color: Color(0xFF2A5D4A),
-                ),
-              ),
-              title: const Text(
-                'Weekend trek',
-                style: TextStyle(fontWeight: FontWeight.w800),
-              ),
-              subtitle: const Text('6 members | 3 nearby'),
-              trailing: const Icon(Icons.chevron_right_rounded),
-              onTap: () => ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Group chat will open here.')),
-              ),
-            ),
-          ),
-          const SizedBox(height: 24),
           const Text(
-            'Messages are encrypted before they leave your phone. Nearby devices can relay them without reading them.',
+            'Connection requests must be accepted before private chat is available. A Bluetooth loss immediately marks the conversation disconnected.',
             style: TextStyle(color: Color(0xFF68736D), height: 1.35),
           ),
         ],
       ),
     );
   }
+
+  Widget _nearbyEmpty() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 8, 4, 8),
+      child: Text(
+        _state == MeshState.running
+            ? 'Scanning… no resQ people in range yet.'
+            : 'Turn Bluetooth discovery on to find people nearby.',
+        style: const TextStyle(color: Color(0xFF68736D), height: 1.3),
+      ),
+    );
+  }
+
+  String _contactDetail(ConnectionStatus status) => switch (status) {
+    ConnectionStatus.available => 'Nearby • tap to request connection',
+    ConnectionStatus.outgoingPending => 'Request sent • waiting for acceptance',
+    ConnectionStatus.incomingPending => 'Connection request waiting',
+    ConnectionStatus.connected => 'Connected • private chat ready',
+    ConnectionStatus.rejected => 'Request declined • tap to request again',
+    ConnectionStatus.disconnected => 'Bluetooth disconnected',
+  };
 }
 
 class LibraryScreen extends StatelessWidget {
@@ -1479,7 +1490,7 @@ class SensorSheet extends StatelessWidget {
 }
 
 class StatusPill extends StatelessWidget {
-  StatusPill({required this.label, required this.icon, super.key});
+  const StatusPill({required this.label, required this.icon, super.key});
   final String label;
   final IconData icon;
 
@@ -1650,11 +1661,13 @@ class NearbyDevice extends StatelessWidget {
     required this.name,
     required this.detail,
     required this.onConnect,
+    this.actionLabel = 'Connect',
     super.key,
   });
   final String name;
   final String detail;
   final VoidCallback onConnect;
+  final String actionLabel;
   @override
   Widget build(BuildContext context) => Card(
     child: ListTile(
@@ -1673,7 +1686,7 @@ class NearbyDevice extends StatelessWidget {
       ),
       title: Text(name, style: const TextStyle(fontWeight: FontWeight.w800)),
       subtitle: Text(detail),
-      trailing: TextButton(onPressed: onConnect, child: const Text('Connect')),
+      trailing: TextButton(onPressed: onConnect, child: Text(actionLabel)),
     ),
   );
 }
@@ -1857,7 +1870,8 @@ String _indexMessage(LocalDocument document) {
   };
 }
 
-String _generalPrompt(String question) => '''
+String _generalPrompt(String question) =>
+    '''
 Answer the following question as a helpful offline assistant. Be concise and clear.
 
 Question: $question

@@ -13,12 +13,18 @@ class MessageType {
   final int value;
 
   // Public / mesh-control
-  static const announce = MessageType._(0x01); // "I'm here" + nickname/keys (TLV)
+  static const announce = MessageType._(
+    0x01,
+  ); // "I'm here" + nickname/keys (TLV)
   static const message = MessageType._(0x02); // public chat message
   static const leave = MessageType._(0x03); // "I'm leaving"
   static const courierEnvelope = MessageType._(0x04);
   static const requestSync = MessageType._(0x21);
-  static const syncDoc = MessageType._(0x30); // our CRDT sync carrier (project novelty)
+  static const syncDoc = MessageType._(
+    0x30,
+  ); // our CRDT sync carrier (project novelty)
+  /// resQ's application-level invitation and direct-message envelope.
+  static const personal = MessageType._(0x31);
 
   // Noise encryption (we skip Noise, but must recognise the types)
   static const noiseHandshake = MessageType._(0x10);
@@ -59,5 +65,6 @@ class MessageType {
     pong,
     nostrCarrier,
     voiceFrame,
+    personal,
   ];
 }

@@ -20,13 +20,9 @@ class ChatMessage {
   final String text;
   final int timestamp;
 
-  /// Encode as a JSON string so it round-trips through YArray<String> safely
+  /// Encode as a JSON string so it round-trips through `YArray<String>` safely
   /// (any text is allowed; we never hand-roll delimiters).
-  String toWire() => jsonEncode({
-        's': senderId,
-        't': timestamp,
-        'm': text,
-      });
+  String toWire() => jsonEncode({'s': senderId, 't': timestamp, 'm': text});
 
   static ChatMessage fromWire(String wire) {
     final m = jsonDecode(wire) as Map<String, dynamic>;
@@ -79,7 +75,8 @@ class SyncDocTunnel {
   late final YMap presence;
 
   final StreamController<void> _changed = StreamController<void>.broadcast();
-  final StreamController<String> _deliveredDoc = StreamController<String>.broadcast();
+  final StreamController<String> _deliveredDoc =
+      StreamController<String>.broadcast();
 
   /// Fires after ANY local or remote doc mutation (observe covers both), so
   /// the UI can rebuild the chat from the YArray.

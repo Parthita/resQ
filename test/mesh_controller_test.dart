@@ -49,5 +49,36 @@ void main() {
       expect(ctrl.state, MeshState.running);
       await ctrl.stop();
     });
+
+    test('a private chat needs an accepted request', () async {
+      final linkA = MockBitchatLink(label: 'A');
+      final linkB = MockBitchatLink(label: 'B');
+      linkA.pairWith(linkB);
+      final a = MeshController(link: linkA);
+      final b = MeshController(link: linkB);
+      await a.start();
+      await b.start();
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+
+      expect(a.contacts, hasLength(1));
+      expect(b.contacts, hasLength(1));
+      final bFromA = a.contacts.single;
+      await a.requestConnection(bFromA);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      final aFromB = b.contacts.single;
+      expect(a.contacts.single.status, ConnectionStatus.outgoingPending);
+      expect(aFromB.status, ConnectionStatus.incomingPending);
+
+      await b.respondToRequest(aFromB, true);
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(a.contacts.single.status, ConnectionStatus.connected);
+      expect(b.contacts.single.status, ConnectionStatus.connected);
+
+      await a.sendPersonalMessage(a.contacts.single, 'only for B');
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      expect(b.messagesFor(aFromB.id).single.text, 'only for B');
+      await a.stop();
+      await b.stop();
+    });
   });
 }

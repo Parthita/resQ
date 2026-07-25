@@ -5,14 +5,26 @@ import 'dart:typed_data';
 /// [id] is the BLE device UUID; [name] is the advertised name (may be null);
 /// [connected] flips true once the GATT link is up.
 class LinkPeer {
-  LinkPeer({required this.id, this.name, this.connected = false});
+  LinkPeer({
+    required this.id,
+    this.name,
+    this.identityHint,
+    this.connected = false,
+  });
 
   final String id;
   final String? name;
+
+  /// The sender-id advertised by a resQ peer, when available.
+  final String? identityHint;
   final bool connected;
 
-  LinkPeer copyWith({bool? connected}) =>
-      LinkPeer(id: id, name: name, connected: connected ?? this.connected);
+  LinkPeer copyWith({bool? connected}) => LinkPeer(
+    id: id,
+    name: name,
+    identityHint: identityHint,
+    connected: connected ?? this.connected,
+  );
 }
 
 /// Abstract byte-pipe between two mesh peers over BLE.

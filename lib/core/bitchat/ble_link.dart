@@ -44,11 +44,14 @@ class BleLink implements BitchatLink {
   final StreamController<LinkPeer> _peersController =
       StreamController<LinkPeer>.broadcast();
   final Map<String, Peripheral> _connected = {};
+  final Set<String> _connecting = <String>{};
+  final Set<String> _inboundCentrals = <String>{};
   GATTCharacteristic? _centralChar;
   Peripheral? _centralPeripheral;
   final List<Central> _subscribedCentrals = [];
   bool _advertising = false;
   bool _scanning = false;
+  Timer? _scanHeartbeat;
 
   late final UUID _serviceUuid;
   late final UUID _charUuid;
@@ -62,8 +65,7 @@ class BleLink implements BitchatLink {
   Stream<LinkPeer> get peers => _peersController.stream;
 
   @override
-  bool get isPoweredOn =>
-      _central.state == BluetoothLowEnergyState.poweredOn;
+  bool get isPoweredOn => _central.state == BluetoothLowEnergyState.poweredOn;
 
   @override
   Future<void> start() async {
@@ -71,19 +73,65 @@ class BleLink implements BitchatLink {
     // Android when the system reports 'unauthorized').
     _central.stateChanged.listen((args) {
       if (args.state == BluetoothLowEnergyState.unauthorized) {
-        _central.authorize();
+        unawaited(_central.authorize());
+      }
+    });
+    _peripheral.stateChanged.listen((args) {
+      if (args.state == BluetoothLowEnergyState.unauthorized) {
+        unawaited(_peripheral.authorize());
+      }
+    });
+    // These are the authoritative disconnect callbacks.  Relying on a failed
+    // write leaves the People UI showing a stale "Connected" state until the
+    // next scan result arrives.
+    _central.connectionStateChanged.listen((args) {
+      final id = args.peripheral.uuid.toString();
+      if (args.state == ConnectionState.disconnected) {
+        _connecting.remove(id);
+        _connected.remove(id);
+        if (identical(_centralPeripheral, args.peripheral)) {
+          _centralPeripheral = null;
+          _centralChar = null;
+        }
+      }
+      if (!_peersController.isClosed) {
+        _peersController.add(
+          LinkPeer(id: id, connected: args.state == ConnectionState.connected),
+        );
+      }
+    });
+    _peripheral.connectionStateChanged.listen((args) {
+      final id = args.central.uuid.toString();
+      if (args.state == ConnectionState.connected) {
+        _inboundCentrals.add(id);
+        debugPrint(
+          '[bitchat:ble] inbound central connected $id; suppressing outbound races',
+        );
+      }
+      if (args.state == ConnectionState.disconnected) {
+        _subscribedCentrals.remove(args.central);
+        _inboundCentrals.remove(id);
+      }
+      if (!_peersController.isClosed) {
+        _peersController.add(
+          LinkPeer(
+            id: args.central.uuid.toString(),
+            connected: args.state == ConnectionState.connected,
+          ),
+        );
       }
     });
 
-    // Authoritative adapter check: must be powered on to advertise/scan.
-    if (!isPoweredOn) {
-      debugPrint('[bitchat:ble] adapter not powered on — refusing to start');
-      throw const BluetoothOffException();
-    }
+    // The managers commonly begin as `unknown`, especially immediately after
+    // the runtime permission prompt. Wait for the native callback instead of
+    // treating that transient state as Bluetooth being off.
+    await _waitForPoweredOn();
 
-    _serviceUuid = UUID.fromString(useMainnet
-        ? BitchatConstants.serviceUuidMainnet
-        : BitchatConstants.serviceUuidTestnet);
+    _serviceUuid = UUID.fromString(
+      useMainnet
+          ? BitchatConstants.serviceUuidMainnet
+          : BitchatConstants.serviceUuidTestnet,
+    );
     _charUuid = UUID.fromString(BitchatConstants.characteristicUuid);
 
     // --- peripheral setup ---
@@ -112,52 +160,180 @@ class BleLink implements BitchatLink {
     _peripheral.characteristicNotifyStateChanged.listen((args) {
       if (args.state) {
         _subscribedCentrals.add(args.central);
+        debugPrint('[bitchat:ble] central subscribed ${args.central.uuid}');
+        // A central has completed the GATT notify subscription.  This is the
+        // first moment the peripheral can reliably send a packet back, so
+        // surface a fresh connected event for the controller to announce its
+        // signed BitChat identity (matching BitChat's didSubscribe flow).
+        if (!_peersController.isClosed) {
+          _peersController.add(
+            LinkPeer(id: args.central.uuid.toString(), connected: true),
+          );
+        }
       } else {
         _subscribedCentrals.remove(args.central);
+        debugPrint('[bitchat:ble] central unsubscribed ${args.central.uuid}');
       }
     });
     await _peripheral.addService(_service);
-    await _peripheral.startAdvertising(Advertisement(
-      name: 'resQ',
-      serviceUUIDs: [_serviceUuid],
-    ));
-    _advertising = true;
-    debugPrint('[bitchat:ble] advertising service $_serviceUuid as "resQ"');
+    try {
+      await _peripheral.startAdvertising(
+        Advertisement(name: 'resQ', serviceUUIDs: [_serviceUuid]),
+      );
+      _advertising = true;
+      debugPrint('[bitchat:ble] advertising service $_serviceUuid as "resQ"');
+    } on Object catch (error, stackTrace) {
+      // Android may reject LE advertising when the controller has exhausted
+      // advertiser slots or does not support the peripheral role. Scanning is
+      // still useful: this phone can join a nearby resQ advertiser as central.
+      // Do not take the entire mesh down for a peripheral-only limitation.
+      _advertising = false;
+      debugPrint(
+        '[bitchat:ble] advertising unavailable; continuing scan: '
+        '$error\n$stackTrace',
+      );
+    }
 
     // --- central setup ---
     _central.discovered.listen(_onDiscovered);
     _central.characteristicNotified.listen(_onNotified);
+    _central.mtuChanged.listen((args) {
+      debugPrint('[bitchat:ble] MTU updated peer=${args.peripheral.uuid} mtu=${args.mtu}');
+    });
+    _peripheral.mtuChanged.listen((args) {
+      debugPrint('[bitchat:ble] MTU updated central=${args.central.uuid} mtu=${args.mtu}');
+    });
+    debugPrint(
+      '[bitchat:ble] scan filter UUID = $_serviceUuid '
+      '(advertise UUID = $_serviceUuid, char = $_charUuid)',
+    );
     await _central.startDiscovery(serviceUUIDs: [_serviceUuid]);
     _scanning = true;
-    debugPrint('[bitchat:ble] scanning for service $_serviceUuid');
+    debugPrint(
+      '[bitchat:ble] scanning started; '
+      'if no "discovered" lines appear, either no peer advertises '
+      '$_serviceUuid or the OS filtered them out',
+    );
+    // Heartbeat: proves the scan loop is alive even when nothing is found.
+    _scanHeartbeat?.cancel();
+    _scanHeartbeat = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (_scanning) {
+        debugPrint(
+          '[bitchat:ble] scan heartbeat: scanning=$_scanning '
+          'connectedPeers=${_connected.length}',
+        );
+      }
+    });
+  }
+
+  Future<void> _waitForPoweredOn() async {
+    if (_central.state == BluetoothLowEnergyState.unauthorized) {
+      await _central.authorize();
+    }
+    if (_peripheral.state == BluetoothLowEnergyState.unauthorized) {
+      await _peripheral.authorize();
+    }
+    if (isPoweredOn) return;
+
+    final ready = Completer<void>();
+    late final StreamSubscription subscription;
+    subscription = _central.stateChanged.listen((args) {
+      if (args.state == BluetoothLowEnergyState.unauthorized) {
+        unawaited(_central.authorize());
+      }
+      if (args.state == BluetoothLowEnergyState.poweredOn &&
+          !ready.isCompleted) {
+        ready.complete();
+      }
+    });
+    try {
+      await ready.future.timeout(const Duration(seconds: 6));
+    } on TimeoutException {
+      debugPrint('[bitchat:ble] adapter did not become powered on');
+      throw const BluetoothOffException();
+    } finally {
+      await subscription.cancel();
+    }
   }
 
   void _onWriteRequested(GATTCharacteristicWriteRequestedEventArgs args) {
-    debugPrint('[bitchat:ble] peripheral received write (${args.request.value.length} bytes)');
-    if (!_received.isClosed) _received.add(Uint8List.fromList(args.request.value));
+    debugPrint(
+      '[bitchat:ble] peripheral received write from=${args.central.uuid} '
+      'bytes=${args.request.value.length}',
+    );
+    if (!_received.isClosed) {
+      _received.add(Uint8List.fromList(args.request.value));
+    }
     _peripheral.respondWriteRequest(args.request);
   }
 
   void _onNotified(GATTCharacteristicNotifiedEventArgs args) {
-    debugPrint('[bitchat:ble] central received notify (${args.value.length} bytes)');
+    debugPrint(
+      '[bitchat:ble] central received notify from=${args.peripheral.uuid} '
+      'bytes=${args.value.length}',
+    );
     if (!_received.isClosed) _received.add(Uint8List.fromList(args.value));
   }
 
   Future<void> _onDiscovered(DiscoveredEventArgs args) async {
     final peripheral = args.peripheral;
     final id = peripheral.uuid.toString();
-    if (_connected.containsKey(id)) return;
-    debugPrint('[bitchat:ble] discovered $id ("${args.advertisement.name}")');
+    if (_connected.containsKey(id) || _connecting.contains(id)) {
+      debugPrint(
+        '[bitchat:ble] skip discovery $id (already connected/connecting)',
+      );
+      return;
+    }
+
+    // Only talk to real resQ peers. The OS scan filter may deliver every BLE
+    // device in range (Android often reports empty advertisedServices even for
+    // matches), so we validate here: a peer must either advertise our service
+    // UUID or be named "resQ". Without this we'd connect() to random devices
+    // and flood the log with GATT 257/133 failures.
+    final advertised = args.advertisement.serviceUUIDs;
+    final isResQPeer =
+        advertised.contains(_serviceUuid) || args.advertisement.name == 'resQ';
+    if (!isResQPeer) {
+      debugPrint(
+        '[bitchat:ble] ignore non-resQ device '
+        '$id name="${args.advertisement.name}" services=$advertised',
+      );
+      return;
+    }
+
+    // If the other phone has already dialled this device, use that stable
+    // peripheral link instead of racing it with a second central connection.
+    if (_inboundCentrals.isNotEmpty) {
+      debugPrint(
+        '[bitchat:ble] skip outbound $id (inbound link already exists)',
+      );
+      return;
+    }
+    debugPrint(
+      '[bitchat:ble] discovered resQ peer $id rssi=${args.rssi} '
+      'advertisedServices=$advertised',
+    );
     // surface "discovered" so the UI can show it before the GATT link is up
     if (!_peersController.isClosed) {
-      _peersController.add(LinkPeer(
-        id: id,
-        name: args.advertisement.name,
-        connected: false,
-      ));
+      _peersController.add(
+        LinkPeer(id: id, name: args.advertisement.name, connected: false),
+      );
     }
+    // Must be set before the first await: Android emits repeated discoveries
+    // while connect/discoverGATT is pending.
+    _connecting.add(id);
     try {
       await _central.connect(peripheral);
+      // The BitChat fragment payload is up to 469 bytes. Without negotiating
+      // MTU, Android silently breaks it into 20-byte ATT writes and the
+      // receiver mistakes each piece for a complete BitChat fragment.
+      try {
+        final mtu = await _central.requestMTU(peripheral, mtu: 517);
+        debugPrint('[bitchat:ble] requested MTU=517 peer=$id negotiated=$mtu');
+      } on Object catch (error) {
+        debugPrint('[bitchat:ble] MTU request failed peer=$id error=$error');
+        rethrow;
+      }
       final services = await _central.discoverGATT(peripheral);
       final svc = services.firstWhere((s) => s.uuid == _serviceUuid);
       final ch = svc.characteristics.firstWhere((c) => c.uuid == _charUuid);
@@ -166,15 +342,24 @@ class BleLink implements BitchatLink {
       _centralChar = ch;
       _connected[id] = peripheral;
       if (!_peersController.isClosed) {
-        _peersController.add(LinkPeer(
-          id: id,
-          name: args.advertisement.name,
-          connected: true,
-        ));
+        _peersController.add(
+          LinkPeer(id: id, name: args.advertisement.name, connected: true),
+        );
       }
-      debugPrint('[bitchat:ble] CONNECTED to $id — subscribed, ready to exchange');
+      debugPrint(
+        '[bitchat:ble] CONNECTED to $id — subscribed, ready to exchange',
+      );
     } on Object catch (e) {
-      debugPrint('[bitchat:ble] connect failed: $e');
+      debugPrint('[bitchat:ble] connect failed id=$id error=$e');
+      // Cancel the failed GATT client so Android does not retain one of its
+      // very limited per-process client slots (the source of status 133).
+      try {
+        await _central.disconnect(peripheral);
+      } on Object {
+        // It may never have reached the connected state; nothing to release.
+      }
+    } finally {
+      _connecting.remove(id);
     }
   }
 
@@ -184,8 +369,11 @@ class BleLink implements BitchatLink {
     // peripheral side: notify every subscribed central
     for (final central in _subscribedCentrals) {
       try {
-        await _peripheral.notifyCharacteristic(central, _mutableChar,
-            value: frame);
+        await _peripheral.notifyCharacteristic(
+          central,
+          _mutableChar,
+          value: frame,
+        );
         delivered = true;
       } on Object {
         // a disconnected central; drop it lazily
@@ -205,14 +393,22 @@ class BleLink implements BitchatLink {
         // ignore
       }
     }
+    debugPrint(
+      '[bitchat:ble] send bytes=${frame.length} delivered=$delivered '
+      'subscribers=${_subscribedCentrals.length} centralLink=${_centralPeripheral != null}',
+    );
     return delivered;
   }
 
   @override
   Future<void> stop() async {
+    _scanHeartbeat?.cancel();
     if (_scanning) await _central.stopDiscovery();
     if (_advertising) await _peripheral.stopAdvertising();
-    for (final p in _connected.values) {
+    // Iterate a snapshot: disconnect() can fire a connection-state callback
+    // that mutates _connected/_subscribedCentrals, which would throw
+    // "Concurrent modification during iteration" if we walked the live map.
+    for (final p in List.of(_connected.values)) {
       try {
         await _central.disconnect(p);
       } on Object {
@@ -220,6 +416,8 @@ class BleLink implements BitchatLink {
       }
     }
     _connected.clear();
+    _connecting.clear();
+    _inboundCentrals.clear();
     _subscribedCentrals.clear();
     // NOTE: do NOT close _received / _peersController here. A discovery or
     // notify callback may still be in flight; closing now throws
@@ -229,6 +427,7 @@ class BleLink implements BitchatLink {
 
   /// Permanently release the link's streams. Call when the owning controller
   /// is disposed (and the link will not be reused).
+  @override
   Future<void> dispose() async {
     if (!_received.isClosed) await _received.close();
     if (!_peersController.isClosed) await _peersController.close();
