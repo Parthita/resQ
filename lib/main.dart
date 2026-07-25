@@ -2,11 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
-import 'core/document_store.dart';
-import 'core/local_document_repository.dart';
+import 'core/battery_service.dart';
+import 'core/device_sensor_service.dart';
 import 'core/local_llm_service.dart';
+import 'core/location_service.dart';
 import 'core/model_store.dart';
-import 'core/offline_contracts.dart';
 import 'core/bitchat/ble_link.dart';
 import 'mesh_controller.dart';
 import 'personal_chat_screen.dart';
@@ -16,33 +16,20 @@ void main() {
 }
 
 class ResQApp extends StatefulWidget {
-  const ResQApp({this.loadDocuments = true, super.key});
-
-  final bool loadDocuments;
+  const ResQApp({super.key});
 
   @override
   State<ResQApp> createState() => _ResQAppState();
 }
 
 class _ResQAppState extends State<ResQApp> {
-  late final DocumentStore _documents;
   late final ModelStore _model;
 
   @override
   void initState() {
     super.initState();
-    _documents = DocumentStore();
     _model = ModelStore();
     unawaited(_model.refresh());
-    if (widget.loadDocuments) {
-      unawaited(_documents.load());
-    }
-  }
-
-  @override
-  void dispose() {
-    _documents.dispose();
-    super.dispose();
   }
 
   @override
@@ -88,15 +75,14 @@ class _ResQAppState extends State<ResQApp> {
           ),
         ),
       ),
-      home: ResQShell(documents: _documents, model: _model),
+      home: ResQShell(model: _model),
     );
   }
 }
 
 class ResQShell extends StatefulWidget {
-  const ResQShell({required this.documents, required this.model, super.key});
+  const ResQShell({required this.model, super.key});
 
-  final DocumentStore documents;
   final ModelStore model;
 
   @override
@@ -105,20 +91,52 @@ class ResQShell extends StatefulWidget {
 
 class _ResQShellState extends State<ResQShell> {
   int _selectedIndex = 0;
+  late final MeshController _mesh;
+  late final BatteryService _battery;
+  late final LocationService _location;
+  late final DeviceSensorService _deviceSensors;
+
+  @override
+  void initState() {
+    super.initState();
+    _mesh = MeshController();
+    _battery = BatteryService();
+    _location = LocationService();
+    _deviceSensors = DeviceSensorService();
+    unawaited(_battery.init());
+    unawaited(_location.init());
+    unawaited(_deviceSensors.init());
+  }
+
+  @override
+  void dispose() {
+    _mesh.dispose();
+    _battery.dispose();
+    _location.dispose();
+    _deviceSensors.dispose();
+    super.dispose();
+  }
+
+  void _setTab(int index) {
+    setState(() => _selectedIndex = index);
+  }
 
   void _openSensors() {
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       backgroundColor: Colors.transparent,
-      builder: (_) => const SensorSheet(),
+      builder: (_) => SensorSheet(
+        location: _location,
+        deviceSensors: _deviceSensors,
+      ),
     );
   }
 
   void _openSos() {
     showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         icon: const Icon(Icons.sos_rounded, color: Color(0xFFC33D30), size: 42),
         title: const Text('Send an SOS?'),
         content: const Text(
@@ -126,7 +144,7 @@ class _ResQShellState extends State<ResQShell> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Cancel'),
           ),
           FilledButton(
@@ -134,13 +152,17 @@ class _ResQShellState extends State<ResQShell> {
               backgroundColor: const Color(0xFFC33D30),
               foregroundColor: Colors.white,
             ),
-            onPressed: () {
-              Navigator.pop(context);
-              ScaffoldMessenger.of(this.context).showSnackBar(
-                const SnackBar(
-                  content: Text('SOS queued for nearby delivery.'),
-                ),
-              );
+            onPressed: () async {
+              Navigator.pop(dialogContext);
+              final sent = await _mesh.sendSos();
+              if (!mounted) return;
+              if (!sent) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Start the mesh first in the People tab before sending an SOS.'),
+                  ),
+                );
+              }
             },
             child: const Text('Hold to send'),
           ),
@@ -153,16 +175,18 @@ class _ResQShellState extends State<ResQShell> {
   Widget build(BuildContext context) {
     final pages = [
       HomeScreen(
-        documents: widget.documents,
+        mesh: _mesh,
+        battery: _battery,
+        location: _location,
         onAssistant: () => setState(() => _selectedIndex = 1),
         onPeople: () => setState(() => _selectedIndex = 2),
         onLibrary: () => setState(() => _selectedIndex = 3),
         onSensors: _openSensors,
         onSos: _openSos,
       ),
-      AssistantScreen(documents: widget.documents, model: widget.model),
-      const PeopleScreen(),
-      LibraryScreen(documents: widget.documents, model: widget.model),
+      AssistantScreen(model: widget.model),
+      PeopleScreen(mesh: _mesh),
+      LibraryScreen(model: widget.model),
     ];
 
     return Scaffold(
@@ -188,9 +212,9 @@ class _ResQShellState extends State<ResQShell> {
             label: 'People',
           ),
           NavigationDestination(
-            icon: Icon(Icons.folder_outlined),
-            selectedIcon: Icon(Icons.folder),
-            label: 'Library',
+            icon: Icon(Icons.settings_outlined),
+            selectedIcon: Icon(Icons.settings),
+            label: 'Settings',
           ),
         ],
       ),
@@ -200,7 +224,9 @@ class _ResQShellState extends State<ResQShell> {
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({
-    required this.documents,
+    required this.mesh,
+    required this.battery,
+    required this.location,
     required this.onAssistant,
     required this.onPeople,
     required this.onLibrary,
@@ -209,7 +235,9 @@ class HomeScreen extends StatelessWidget {
     super.key,
   });
 
-  final DocumentStore documents;
+  final MeshController mesh;
+  final BatteryService battery;
+  final LocationService location;
   final VoidCallback onAssistant;
   final VoidCallback onPeople;
   final VoidCallback onLibrary;
@@ -226,42 +254,55 @@ class HomeScreen extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
             sliver: SliverList(
               delegate: SliverChildListDelegate([
-                Row(
-                  children: [
-                    Container(
-                      width: 44,
-                      height: 44,
-                      decoration: BoxDecoration(
-                        color: scheme.primary,
-                        borderRadius: BorderRadius.circular(15),
-                      ),
-                      child: const Icon(
-                        Icons.terrain_rounded,
-                        color: Colors.white,
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    const Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            'resQ',
-                            style: TextStyle(
-                              fontSize: 26,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: -0.8,
-                            ),
+                StreamBuilder<MeshState>(
+                  stream: mesh.stateStream,
+                  initialData: mesh.state,
+                  builder: (context, snapshot) {
+                    final state = snapshot.data ?? MeshState.stopped;
+                    final isOnline = state == MeshState.running;
+                    return Row(
+                      children: [
+                        Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            color: scheme.primary,
+                            borderRadius: BorderRadius.circular(15),
                           ),
-                          Text(
-                            'Offline when it matters',
-                            style: TextStyle(color: Color(0xFF68736D)),
+                          child: const Icon(
+                            Icons.terrain_rounded,
+                            color: Colors.white,
                           ),
-                        ],
-                      ),
-                    ),
-                    StatusPill(label: 'OFFLINE', icon: Icons.cloud_off_rounded),
-                  ],
+                        ),
+                        const SizedBox(width: 12),
+                        const Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'resQ',
+                                style: TextStyle(
+                                  fontSize: 26,
+                                  fontWeight: FontWeight.w800,
+                                  letterSpacing: -0.8,
+                                ),
+                              ),
+                              Text(
+                                'Offline when it matters',
+                                style: TextStyle(color: Color(0xFF68736D)),
+                              ),
+                            ],
+                          ),
+                        ),
+                        StatusPill(
+                          label: isOnline ? 'ONLINE' : 'OFFLINE',
+                          icon: isOnline
+                              ? Icons.wifi_rounded
+                              : Icons.cloud_off_rounded,
+                        ),
+                      ],
+                    );
+                  },
                 ),
                 const SizedBox(height: 24),
                 Container(
@@ -295,16 +336,49 @@ class HomeScreen extends StatelessWidget {
                         ),
                       ),
                       const SizedBox(height: 18),
-                      const Row(
+                      Row(
                         children: [
-                          HeroMetric(
-                            icon: Icons.bluetooth_connected_rounded,
-                            label: '3 nearby',
+                          StreamBuilder<List<MeshPeer>>(
+                            stream: mesh.peersStream,
+                            initialData: mesh.currentPeers,
+                            builder: (context, snapshot) {
+                              final peers = snapshot.data ?? [];
+                              final connected =
+                                  peers.where((p) => p.connected).length;
+                              return HeroMetric(
+                                icon: Icons.bluetooth_connected_rounded,
+                                label: connected > 0
+                                    ? '$connected nearby'
+                                    : 'No peers',
+                              );
+                            },
                           ),
-                          SizedBox(width: 12),
-                          HeroMetric(
-                            icon: Icons.location_on_outlined,
-                            label: 'GPS saved',
+                          const SizedBox(width: 12),
+                          ListenableBuilder(
+                            listenable: location,
+                            builder: (context, _) {
+                              final status = location.status;
+                              String label;
+                              if (status == GpsStatus.available &&
+                                  location.lastFix != null) {
+                                final diff = DateTime.now()
+                                    .difference(location.lastFix!)
+                                    .inMinutes;
+                                label = diff < 1
+                                    ? 'GPS now'
+                                    : 'GPS ${diff}m ago';
+                              } else if (status == GpsStatus.permissionDenied) {
+                                label = 'No GPS perm';
+                              } else if (status == GpsStatus.loading) {
+                                label = 'GPS ...';
+                              } else {
+                                label = 'GPS off';
+                              }
+                              return HeroMetric(
+                                icon: Icons.location_on_outlined,
+                                label: label,
+                              );
+                            },
                           ),
                         ],
                       ),
@@ -344,16 +418,36 @@ class HomeScreen extends StatelessWidget {
                       color: const Color(0xFFC33D30),
                       onTap: onSos,
                     ),
-                    QuickAction(
-                      label: 'Share location',
-                      subtitle: 'Last fix: now',
-                      icon: Icons.my_location_rounded,
-                      color: const Color(0xFF1C6B83),
-                      onTap: onPeople,
+                    ListenableBuilder(
+                      listenable: location,
+                      builder: (context, _) {
+                        String subtitle;
+                        if (location.status == GpsStatus.available &&
+                            location.lastFix != null) {
+                          final diff = DateTime.now()
+                              .difference(location.lastFix!)
+                              .inMinutes;
+                          subtitle = diff < 1
+                              ? 'Last fix: now'
+                              : 'Last fix: ${diff}m ago';
+                        } else if (location.status ==
+                            GpsStatus.permissionDenied) {
+                          subtitle = 'Location denied';
+                        } else {
+                          subtitle = 'No GPS fix';
+                        }
+                        return QuickAction(
+                          label: 'Share location',
+                          subtitle: subtitle,
+                          icon: Icons.my_location_rounded,
+                          color: const Color(0xFF1C6B83),
+                          onTap: onPeople,
+                        );
+                      },
                     ),
                     QuickAction(
                       label: 'Ask resQ',
-                      subtitle: 'Docs + local AI',
+                      subtitle: 'Local AI assistant',
                       icon: Icons.auto_awesome_rounded,
                       color: const Color(0xFF75613B),
                       onTap: onAssistant,
@@ -375,55 +469,115 @@ class HomeScreen extends StatelessWidget {
                   ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
                 ),
                 const SizedBox(height: 12),
-                AnimatedBuilder(
-                  animation: documents,
-                  builder: (context, _) {
-                    final documentCount = documents.documents.length;
-                    final documentTitle = documentCount == 0
-                        ? 'No documents yet'
-                        : '$documentCount offline ${documentCount == 1 ? 'document' : 'documents'}';
-                    final documentDetail = documents.isLoading
-                        ? 'Loading your library'
-                        : documentCount == 0
-                        ? 'Import a PDF to chat with it'
-                        : 'Ready for document chat';
+                StreamBuilder<MeshState>(
+                  stream: mesh.stateStream,
+                  initialData: mesh.state,
+                  builder: (context, meshSnapshot) {
+                    final isMeshRunning =
+                        meshSnapshot.data == MeshState.running;
+                    final contacts = mesh.contacts;
+                    final peerCount = mesh.connectedCount;
+                    return ListenableBuilder(
+                      listenable: Listenable.merge([battery, location]),
+                      builder: (context, _) {
+                        final batteryStatus = battery.status;
+                        String batteryTitle;
+                        String batteryDetail;
+                        if (batteryStatus == BatteryStatus.loading) {
+                          batteryTitle = 'Battery ...';
+                          batteryDetail = 'Reading battery';
+                        } else if (batteryStatus == BatteryStatus.unavailable ||
+                            batteryStatus == BatteryStatus.error) {
+                          batteryTitle = 'Battery unavailable';
+                          batteryDetail = 'Could not read battery';
+                        } else {
+                          final charge = battery.isCharging
+                              ? 'Charging'
+                              : 'On battery';
+                          batteryTitle = 'Battery ${battery.level}%';
+                          batteryDetail = battery.isPowerSave
+                              ? '$charge • Power saver on'
+                              : charge;
+                        }
 
-                    return Card(
-                      child: Padding(
-                        padding: const EdgeInsets.all(18),
-                        child: Column(
-                          children: [
-                            const InfoRow(
-                              icon: Icons.group_outlined,
-                              title: 'Weekend trek',
-                              detail: '6 members, 3 nearby',
-                              color: Color(0xFF2A5D4A),
+                        final gpsStatus = location.status;
+                        String gpsTitle;
+                        String gpsDetail;
+                        if (gpsStatus == GpsStatus.loading) {
+                          gpsTitle = 'GPS ...';
+                          gpsDetail = 'Acquiring position';
+                        } else if (gpsStatus ==
+                            GpsStatus.permissionDenied) {
+                          gpsTitle = 'GPS permission denied';
+                          gpsDetail = 'Enable in Settings';
+                        } else if (gpsStatus == GpsStatus.unavailable) {
+                          gpsTitle = 'GPS disabled';
+                          gpsDetail = 'Turn on location';
+                        } else if (gpsStatus == GpsStatus.error) {
+                          gpsTitle = 'GPS error';
+                          gpsDetail = 'Could not read GPS';
+                        } else {
+                          final pos = location.position;
+                          if (pos != null) {
+                            final lat =
+                                pos.latitude.toStringAsFixed(4);
+                            final lng =
+                                pos.longitude.toStringAsFixed(4);
+                            gpsTitle = '$lat, $lng';
+                            final acc = pos.accuracy;
+                            gpsDetail = acc > 0
+                                ? 'Accuracy +/- ${acc.toStringAsFixed(0)}m'
+                                : 'Position acquired';
+                          } else {
+                            gpsTitle = 'GPS acquired';
+                            gpsDetail = 'Waiting for fix';
+                          }
+                        }
+
+                        return Card(
+                          child: Padding(
+                            padding: const EdgeInsets.all(18),
+                            child: Column(
+                              children: [
+                                InfoRow(
+                                  icon: Icons.group_outlined,
+                                  title: isMeshRunning
+                                      ? (contacts.isNotEmpty
+                                          ? contacts.first.name
+                                          : 'Your mesh')
+                                      : 'Mesh offline',
+                                  detail: isMeshRunning
+                                      ? '${contacts.length} contacts, $peerCount nearby'
+                                      : 'Start mesh in People tab',
+                                  color: const Color(0xFF2A5D4A),
+                                ),
+                                const Divider(height: 28),
+                                InfoRow(
+                                  icon: Icons.battery_5_bar_rounded,
+                                  title: batteryTitle,
+                                  detail: batteryDetail,
+                                  color: const Color(0xFF1C6B83),
+                                ),
+                                const Divider(height: 28),
+                                InfoRow(
+                                  icon: Icons.location_on_outlined,
+                                  title: gpsTitle,
+                                  detail: gpsDetail,
+                                  color: const Color(0xFF75613B),
+                                ),
+                              ],
                             ),
-                            const Divider(height: 28),
-                            InfoRow(
-                              icon: Icons.description_outlined,
-                              title: documentTitle,
-                              detail: documentDetail,
-                              color: const Color(0xFF75613B),
-                            ),
-                            const Divider(height: 28),
-                            const InfoRow(
-                              icon: Icons.battery_5_bar_rounded,
-                              title: 'Battery 74%',
-                              detail: 'Battery saver is off',
-                              color: Color(0xFF1C6B83),
-                            ),
-                          ],
-                        ),
-                      ),
+                          ),
+                        );
+                      },
                     );
                   },
                 ),
                 const SizedBox(height: 14),
                 OutlinedButton.icon(
                   onPressed: onLibrary,
-                  icon: const Icon(Icons.add_circle_outline_rounded),
-                  label: const Text('Add a guide, note, or observation'),
+                  icon: const Icon(Icons.settings_outlined),
+                  label: const Text('Manage model and settings'),
                   style: OutlinedButton.styleFrom(
                     minimumSize: const Size.fromHeight(52),
                   ),
@@ -439,12 +593,10 @@ class HomeScreen extends StatelessWidget {
 
 class AssistantScreen extends StatefulWidget {
   const AssistantScreen({
-    required this.documents,
     required this.model,
     super.key,
   });
 
-  final DocumentStore documents;
   final ModelStore model;
 
   @override
@@ -457,11 +609,10 @@ class _AssistantScreenState extends State<AssistantScreen>
   final List<_ChatMessage> _messages = [
     const _ChatMessage(
       content:
-          'I can answer from your local guides and documents. Nothing in this conversation leaves this phone.',
+          'I can answer questions using the local model. Nothing in this conversation leaves this phone.',
       isAssistant: true,
     ),
   ];
-  String? _selectedDocumentId;
   bool _isGenerating = false;
   late final AnimationController _thinkingAnimation;
 
@@ -514,82 +665,9 @@ class _AssistantScreenState extends State<AssistantScreen>
     }
   }
 
-  LocalDocument? get _selectedDocument {
-    final documentId = _selectedDocumentId;
-    if (documentId == null) return null;
-
-    for (final document in widget.documents.documents) {
-      if (document.id == documentId) return document;
-    }
-    return null;
-  }
-
-  Future<void> _importDocument() async {
-    try {
-      final document = await widget.documents.pickAndImportPdf();
-      if (!mounted || document == null) return;
-      setState(() => _selectedDocumentId = document.id);
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(_indexMessage(document))));
-    } on DocumentStorageException catch (error) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(error.message)));
-    }
-  }
-
-  Future<void> _selectDocument() async {
-    await showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (sheetContext) => SafeArea(
-        child: ListView(
-          shrinkWrap: true,
-          padding: const EdgeInsets.fromLTRB(20, 4, 20, 24),
-          children: [
-            const Text(
-              'Choose assistant context',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 12),
-            ListTile(
-              leading: const Icon(Icons.auto_awesome_rounded),
-              title: const Text('General offline assistant'),
-              trailing: _selectedDocument == null
-                  ? const Icon(Icons.check_rounded)
-                  : null,
-              onTap: () {
-                setState(() => _selectedDocumentId = null);
-                Navigator.pop(sheetContext);
-              },
-            ),
-            for (final document in widget.documents.documents)
-              ListTile(
-                leading: const Icon(Icons.picture_as_pdf_rounded),
-                title: Text(document.name),
-                subtitle: Text(
-                  '${_formatBytes(document.byteCount)} | ${_documentStatus(document)}',
-                ),
-                trailing: _selectedDocument?.id == document.id
-                    ? const Icon(Icons.check_rounded)
-                    : null,
-                onTap: () {
-                  setState(() => _selectedDocumentId = document.id);
-                  Navigator.pop(sheetContext);
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Future<void> _send() async {
     final text = _controller.text.trim();
     if (text.isEmpty) return;
-    final document = _selectedDocument;
     setState(() {
       _messages.add(_ChatMessage(content: text, isAssistant: false));
       _controller.clear();
@@ -602,7 +680,7 @@ class _AssistantScreenState extends State<AssistantScreen>
         _messages.add(
           const _ChatMessage(
             content:
-                'Import a GGUF model from Library before asking the offline assistant.',
+                'Import a GGUF model from Settings before asking the offline assistant.',
             isAssistant: true,
           ),
         );
@@ -624,45 +702,14 @@ class _AssistantScreenState extends State<AssistantScreen>
       return;
     }
 
-    List<DocumentSearchHit> hits = const [];
-    if (document != null) {
-      if (document.indexState != DocumentIndexState.ready) {
-        setState(() {
-          _isGenerating = false;
-          _messages.add(
-            _ChatMessage(content: _indexMessage(document), isAssistant: true),
-          );
-        });
-        return;
-      }
-      hits = await widget.documents.search(document, text);
-      if (!mounted) return;
-    }
-
-    if (document != null && hits.isEmpty) {
-      setState(() {
-        _isGenerating = false;
-        _messages.add(
-          _ChatMessage(
-            content:
-                'I could not find relevant text in ${document.name}. Try a more specific question or switch to general assistant.',
-            isAssistant: true,
-          ),
-        );
-      });
-      return;
-    }
+    final prompt = _generalPrompt(text);
 
     setState(() {
       _messages.add(const _ChatMessage(content: '', isAssistant: true));
     });
 
     try {
-      await for (final token in widget.model.generate(
-        prompt: document == null
-            ? _generalPrompt(text)
-            : _groundedPrompt(question: text, hits: hits),
-      )) {
+      await for (final token in widget.model.generate(prompt: prompt)) {
         if (!mounted) return;
         setState(() {
           final last = _messages.removeLast();
@@ -682,12 +729,16 @@ class _AssistantScreenState extends State<AssistantScreen>
     }
   }
 
+  void _openSettings(BuildContext context) {
+    final shell = context.findAncestorStateOfType<_ResQShellState>();
+    shell?._setTab(3);
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: Listenable.merge([widget.documents, widget.model]),
+      animation: widget.model,
       builder: (context, _) {
-        final selectedDocument = _selectedDocument;
         return SafeArea(
           child: Column(
             children: [
@@ -709,64 +760,54 @@ class _AssistantScreenState extends State<AssistantScreen>
                           ),
                           SizedBox(height: 3),
                           Text(
-                            'Private. Local. Source-aware.',
+                            'Private. Local. Offline.',
                             style: TextStyle(color: Color(0xFF68736D)),
                           ),
                         ],
                       ),
                     ),
                     IconButton.filledTonal(
-                      onPressed: _importDocument,
-                      icon: const Icon(Icons.add_rounded),
-                      tooltip: 'Add a document',
+                      onPressed: () => _openSettings(context),
+                      icon: const Icon(Icons.settings_rounded),
+                      tooltip: 'Settings',
                     ),
                   ],
                 ),
               ),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20),
-                child: InkWell(
-                  borderRadius: BorderRadius.circular(18),
-                  onTap: _selectDocument,
-                  child: Ink(
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: selectedDocument != null
-                          ? const Color(0xFFE2F0E4)
-                          : const Color(0xFFE8E7E0),
-                      borderRadius: BorderRadius.circular(18),
-                    ),
-                    child: Row(
-                      children: [
-                        Icon(
-                          selectedDocument != null
-                              ? Icons.description_rounded
-                              : Icons.auto_awesome_rounded,
-                          color: const Color(0xFF2A5D4A),
+                child: Container(
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFE8E7E0),
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(
+                        Icons.auto_awesome_rounded,
+                        color: Color(0xFF68736D),
+                        size: 20,
+                      ),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Offline assistant',
+                          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 13, color: Color(0xFF68736D)),
                         ),
-                        const SizedBox(width: 10),
-                        Expanded(
-                          child: Text(
-                            selectedDocument != null
-                                ? 'Using: ${selectedDocument.name}'
-                                : 'General offline assistant',
-                            style: const TextStyle(fontWeight: FontWeight.w700),
-                          ),
-                        ),
-                        const Icon(Icons.expand_more_rounded),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 12),
               Padding(
                 padding: const EdgeInsets.symmetric(horizontal: 20),
                 child: InkWell(
                   borderRadius: BorderRadius.circular(18),
                   onTap: _toggleModel,
                   child: Ink(
-                    padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(12),
                     decoration: BoxDecoration(
                       color: widget.model.isBusy
                           ? const Color(0xFFE8E7E0)
@@ -928,14 +969,15 @@ class _AssistantScreenState extends State<AssistantScreen>
 }
 
 class PeopleScreen extends StatefulWidget {
-  const PeopleScreen({super.key});
+  const PeopleScreen({required this.mesh, super.key});
+
+  final MeshController mesh;
 
   @override
   State<PeopleScreen> createState() => _PeopleScreenState();
 }
 
 class _PeopleScreenState extends State<PeopleScreen> {
-  final MeshController _mesh = MeshController();
   MeshState _state = MeshState.stopped;
   String _statusText = 'Mesh is off';
   bool _permDenied = false;
@@ -946,7 +988,7 @@ class _PeopleScreenState extends State<PeopleScreen> {
   @override
   void initState() {
     super.initState();
-    _mesh.stateStream.listen((s) {
+    widget.mesh.stateStream.listen((s) {
       if (!mounted) return;
       setState(() {
         _state = s;
@@ -958,18 +1000,17 @@ class _PeopleScreenState extends State<PeopleScreen> {
         };
       });
     });
-    _mesh.peersStream.listen((peers) {
+    widget.mesh.peersStream.listen((peers) {
       if (mounted) setState(() => _peerList = peers);
     });
   }
 
   Future<void> _toggleMesh() async {
     if (_state == MeshState.running || _state == MeshState.starting) {
-      await _mesh.stop();
+      await widget.mesh.stop();
       return;
     }
-    // 1) runtime permission + adapter check (the half the manifest alone can't do)
-    final result = await _mesh.requestPermissions();
+    final result = await widget.mesh.requestPermissions();
     if (!mounted) return;
     if (!result.ok) {
       setState(() {
@@ -985,9 +1026,8 @@ class _PeopleScreenState extends State<PeopleScreen> {
       _locationDenied = false;
       _btOff = false;
     });
-    // 2) start BLE + flood router + CRDT tunnel
     try {
-      await _mesh.start();
+      await widget.mesh.start();
     } on BluetoothOffException {
       if (!mounted) return;
       setState(() => _btOff = true);
@@ -1000,7 +1040,7 @@ class _PeopleScreenState extends State<PeopleScreen> {
       case ConnectionStatus.available:
       case ConnectionStatus.rejected:
       case ConnectionStatus.disconnected:
-        await _mesh.requestConnection(contact);
+        await widget.mesh.requestConnection(contact);
         return;
       case ConnectionStatus.incomingPending:
         if (!mounted) return;
@@ -1023,26 +1063,20 @@ class _PeopleScreenState extends State<PeopleScreen> {
             ],
           ),
         );
-        if (accepted != null) await _mesh.respondToRequest(contact, accepted);
+        if (accepted != null) await widget.mesh.respondToRequest(contact, accepted);
         return;
       case ConnectionStatus.connected:
         if (!mounted) return;
         Navigator.of(context).push(
           MaterialPageRoute(
             builder: (_) =>
-                PersonalChatScreen(controller: _mesh, contact: contact),
+                PersonalChatScreen(controller: widget.mesh, contact: contact),
           ),
         );
         return;
       case ConnectionStatus.outgoingPending:
         break;
     }
-  }
-
-  @override
-  void dispose() {
-    _mesh.dispose();
-    super.dispose();
   }
 
   @override
@@ -1143,18 +1177,14 @@ class _PeopleScreenState extends State<PeopleScreen> {
           SectionTitle(
             title: 'Nearby people',
             action: 'Scan',
-            onAction: () => _mesh.refreshPresence(),
+            onAction: () => widget.mesh.refreshPresence(),
           ),
           const SizedBox(height: 10),
           StreamBuilder<List<PersonalContact>>(
-            stream: _mesh.contactsStream,
-            initialData: _mesh.contacts,
+            stream: widget.mesh.contactsStream,
+            initialData: widget.mesh.contacts,
             builder: (context, snapshot) {
               final contacts = snapshot.data ?? const [];
-              // Android can surface several rotating BLE addresses for the
-              // same phone (scan address, inbound central, outbound GATT).
-              // A verified BitChat sender id is the stable person identity,
-              // so raw transport aliases are only shown before verification.
               final rawPeers = contacts.isEmpty
                   ? _peerList
                   : const <MeshPeer>[];
@@ -1169,7 +1199,7 @@ class _PeopleScreenState extends State<PeopleScreen> {
                           detail: peer.connected
                               ? 'Connected • verifying identity…'
                               : 'resQ device detected • connecting…',
-                          onConnect: () => _mesh.refreshPresence(),
+                          onConnect: () => widget.mesh.refreshPresence(),
                           actionLabel: 'Refresh',
                         ),
                       ),
@@ -1226,37 +1256,23 @@ class _PeopleScreenState extends State<PeopleScreen> {
   };
 }
 
-class LibraryScreen extends StatelessWidget {
+class LibraryScreen extends StatefulWidget {
   const LibraryScreen({
-    required this.documents,
     required this.model,
     super.key,
   });
 
-  final DocumentStore documents;
   final ModelStore model;
 
-  Future<void> _importDocument(BuildContext context) async {
-    try {
-      final document = await documents.pickAndImportPdf();
-      if (context.mounted && document != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('${document.name} saved for offline use.')),
-        );
-      }
-    } on DocumentStorageException catch (error) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(error.message)));
-      }
-    }
-  }
+  @override
+  State<LibraryScreen> createState() => _LibraryScreenState();
+}
 
-  Future<void> _importModel(BuildContext context) async {
+class _LibraryScreenState extends State<LibraryScreen> {
+  Future<void> _importModel() async {
     try {
-      final imported = await model.import();
-      if (!context.mounted) return;
+      final imported = await widget.model.import();
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
@@ -1267,43 +1283,9 @@ class LibraryScreen extends StatelessWidget {
         ),
       );
     } catch (error) {
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not import model: $error')),
-        );
-      }
-    }
-  }
-
-  Future<void> _deleteDocument(
-    BuildContext context,
-    LocalDocument document,
-  ) async {
-    final shouldDelete = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('Remove this document?'),
-        content: Text(
-          '${document.name} will be deleted from this device. This cannot be undone.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton.tonal(
-            onPressed: () => Navigator.pop(dialogContext, true),
-            child: const Text('Remove'),
-          ),
-        ],
-      ),
-    );
-    if (shouldDelete != true) return;
-
-    await documents.delete(document);
-    if (context.mounted) {
+      if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('${document.name} removed from this device.')),
+        SnackBar(content: Text('Could not import model: $error')),
       );
     }
   }
@@ -1311,7 +1293,7 @@ class LibraryScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return AnimatedBuilder(
-      animation: Listenable.merge([documents, model]),
+      animation: widget.model,
       builder: (context, _) => SafeArea(
         child: ListView(
           padding: const EdgeInsets.fromLTRB(20, 18, 20, 32),
@@ -1323,7 +1305,7 @@ class LibraryScreen extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Library',
+                        'Settings',
                         style: TextStyle(
                           fontSize: 28,
                           fontWeight: FontWeight.w800,
@@ -1332,72 +1314,16 @@ class LibraryScreen extends StatelessWidget {
                       ),
                       SizedBox(height: 3),
                       Text(
-                        'Everything stays on this device',
+                        'Model and device configuration',
                         style: TextStyle(color: Color(0xFF68736D)),
                       ),
                     ],
                   ),
                 ),
-                IconButton.filledTonal(
-                  onPressed: () => _importDocument(context),
-                  icon: const Icon(Icons.add_rounded),
-                  tooltip: 'Import a PDF',
-                ),
               ],
             ),
-            const SizedBox(height: 24),
-            Container(
-              padding: const EdgeInsets.all(18),
-              decoration: BoxDecoration(
-                color: const Color(0xFFE8E4D3),
-                borderRadius: BorderRadius.circular(22),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.lock_outline_rounded, color: Color(0xFF75613B)),
-                  SizedBox(width: 12),
-                  Expanded(
-                    child: Text(
-                      'Imported PDFs are copied into private app storage.',
-                      style: TextStyle(
-                        fontWeight: FontWeight.w700,
-                        color: Color(0xFF5D4D2E),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-            ),
             const SizedBox(height: 28),
-            SectionTitle(
-              title: 'Documents',
-              action: documents.isLoading ? null : 'Import PDF',
-              onAction: () => _importDocument(context),
-            ),
-            const SizedBox(height: 10),
-            if (documents.isLoading)
-              const Center(
-                child: Padding(
-                  padding: EdgeInsets.all(28),
-                  child: CircularProgressIndicator(),
-                ),
-              )
-            else if (documents.documents.isEmpty)
-              EmptyDocumentState(onImport: () => _importDocument(context))
-            else
-              for (final document in documents.documents) ...[
-                LibraryItem(
-                  icon: Icons.picture_as_pdf_rounded,
-                  title: document.name,
-                  subtitle:
-                      'PDF | ${_formatBytes(document.byteCount)} | ${_documentStatus(document)}',
-                  color: const Color(0xFFC33D30),
-                  onDelete: () => _deleteDocument(context, document),
-                ),
-                const SizedBox(height: 10),
-              ],
-            const SizedBox(height: 28),
-            const SectionTitle(title: 'Local model'),
+            const SectionTitle(title: 'Chat model'),
             const SizedBox(height: 10),
             Card(
               child: Padding(
@@ -1408,16 +1334,16 @@ class LibraryScreen extends StatelessWidget {
                       width: 46,
                       height: 46,
                       decoration: BoxDecoration(
-                        color: model.isLoaded
+                        color: widget.model.isLoaded
                             ? const Color(0xFFE2F0E4)
                             : const Color(0xFFE8E7E0),
                         borderRadius: BorderRadius.circular(15),
                       ),
                       child: Icon(
-                        model.isLoaded
+                        widget.model.isLoaded
                             ? Icons.memory_rounded
                             : Icons.memory_outlined,
-                        color: model.isLoaded
+                        color: widget.model.isLoaded
                             ? const Color(0xFF2A5D4A)
                             : const Color(0xFF68736D),
                       ),
@@ -1428,19 +1354,19 @@ class LibraryScreen extends StatelessWidget {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            model.isLoaded
+                            widget.model.isLoaded
                                 ? 'Model loaded in memory'
-                                : model.hasModel
+                                : widget.model.hasModel
                                 ? 'Model stored (not loaded)'
                                 : 'No GGUF model imported',
                             style: const TextStyle(fontWeight: FontWeight.w800),
                           ),
                           const SizedBox(height: 2),
                           Text(
-                            model.isBusy
+                            widget.model.isBusy
                                 ? 'Working…'
-                                : model.hasModel
-                                ? '${_formatBytes(model.status.sizeBytes)} • ${model.isLoaded ? 'loaded' : 'tap load in Assistant'}'
+                                : widget.model.hasModel
+                                ? '${_formatBytes(widget.model.status.sizeBytes)} • ${widget.model.isLoaded ? 'loaded' : 'tap load in Assistant'}'
                                 : 'Import a small quantized GGUF model',
                             style: const TextStyle(
                               color: Color(0xFF68736D),
@@ -1451,37 +1377,19 @@ class LibraryScreen extends StatelessWidget {
                       ),
                     ),
                     TextButton(
-                      onPressed: model.isBusy
+                      onPressed: widget.model.isBusy
                           ? null
-                          : () => _importModel(context),
-                      child: Text(model.hasModel ? 'Replace' : 'Import'),
+                          : _importModel,
+                      child: Text(widget.model.hasModel ? 'Replace' : 'Import'),
                     ),
                   ],
                 ),
               ),
             ),
             const SizedBox(height: 28),
-            const SectionTitle(title: 'Observations'),
-            const SizedBox(height: 10),
-            const Card(
-              child: Padding(
-                padding: EdgeInsets.all(18),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.photo_camera_back_outlined,
-                      color: Color(0xFF75613B),
-                    ),
-                    SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        'Photos, OCR, and saved observations will appear here.',
-                        style: TextStyle(color: Color(0xFF68736D)),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
+            const Text(
+              'Import a GGUF model (e.g. Qwen2.5-0.5B-Q4_K_M) to enable offline AI assistance. The model stays on this device and never sends data to any server.',
+              style: TextStyle(color: Color(0xFF68736D), height: 1.35),
             ),
           ],
         ),
@@ -1490,13 +1398,36 @@ class LibraryScreen extends StatelessWidget {
   }
 }
 
+String _formatBytes(int byteCount) {
+  const bytesInKilobyte = 1024;
+  const bytesInMegabyte = bytesInKilobyte * 1024;
+
+  if (byteCount >= bytesInMegabyte) {
+    return '${(byteCount / bytesInMegabyte).toStringAsFixed(1)} MB';
+  }
+  if (byteCount >= bytesInKilobyte) {
+    return '${(byteCount / bytesInKilobyte).toStringAsFixed(1)} KB';
+  }
+  return '$byteCount B';
+}
+
+String _generalPrompt(String question) =>
+    'Answer the following question as a helpful offline assistant. Be concise and clear.\n\nQuestion: $question';
+
 class SensorSheet extends StatelessWidget {
-  const SensorSheet({super.key});
+  const SensorSheet({
+    required this.location,
+    required this.deviceSensors,
+    super.key,
+  });
+
+  final LocationService location;
+  final DeviceSensorService deviceSensors;
 
   @override
   Widget build(BuildContext context) {
     return DraggableScrollableSheet(
-      initialChildSize: 0.78,
+      initialChildSize: 0.82,
       minChildSize: 0.5,
       maxChildSize: 0.94,
       builder: (context, controller) => Container(
@@ -1533,85 +1464,178 @@ class SensorSheet extends StatelessWidget {
               style: TextStyle(color: Color(0xFF68736D)),
             ),
             const SizedBox(height: 22),
-            Container(
-              height: 190,
-              decoration: BoxDecoration(
-                color: const Color(0xFF17483B),
-                borderRadius: BorderRadius.circular(26),
-              ),
-              child: const Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(
-                    Icons.navigation_rounded,
-                    color: Color(0xFFB9E4C3),
-                    size: 44,
+            ListenableBuilder(
+              listenable: deviceSensors,
+              builder: (context, _) {
+                final heading = deviceSensors.compassStatus ==
+                        SensorStatus.available
+                    ? deviceSensors.heading
+                    : null;
+                final dir = deviceSensors.cardinalDirection;
+                final degrees = heading != null
+                    ? '${heading.toStringAsFixed(0)} degrees'
+                    : deviceSensors.compassStatus == SensorStatus.loading
+                        ? 'Compass initializing...'
+                        : 'Compass unavailable';
+                return Container(
+                  height: 155,
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF17483B),
+                    borderRadius: BorderRadius.circular(26),
                   ),
-                  SizedBox(height: 8),
-                  Text(
-                    'NW',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 48,
-                      fontWeight: FontWeight.w800,
-                    ),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      const Icon(
+                        Icons.navigation_rounded,
+                        color: Color(0xFFB9E4C3),
+                        size: 44,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        dir,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 48,
+                          fontWeight: FontWeight.w800,
+                        ),
+                      ),
+                      Text(
+                        degrees,
+                        style: const TextStyle(color: Color(0xFFC4E3CC)),
+                      ),
+                    ],
                   ),
-                  Text(
-                    '315 degrees',
-                    style: TextStyle(color: Color(0xFFC4E3CC)),
-                  ),
-                ],
-              ),
+                );
+              },
             ),
             const SizedBox(height: 14),
-            GridView.count(
-              crossAxisCount: 2,
-              crossAxisSpacing: 12,
-              mainAxisSpacing: 12,
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              childAspectRatio: 1.55,
-              children: const [
-                SensorMetric(
-                  icon: Icons.my_location_rounded,
-                  label: 'GPS accuracy',
-                  value: '+/- 8 m',
-                ),
-                SensorMetric(
-                  icon: Icons.landscape_rounded,
-                  label: 'Elevation',
-                  value: '1,240 m',
-                ),
-                SensorMetric(
-                  icon: Icons.speed_rounded,
-                  label: 'Speed',
-                  value: '0.0 km/h',
-                ),
-                SensorMetric(
-                  icon: Icons.air_rounded,
-                  label: 'Pressure',
-                  value: '1008 hPa',
-                ),
-              ],
+            ListenableBuilder(
+              listenable: location,
+              builder: (context, _) {
+                final pos = location.position;
+                final accuracy = pos?.accuracy;
+                final altitude = pos?.altitude;
+                final locStatus = location.status;
+                final speed = location.speed;
+
+                String accValue;
+                if (locStatus == GpsStatus.loading) {
+                  accValue = 'Loading...';
+                } else if (locStatus == GpsStatus.permissionDenied) {
+                  accValue = 'Permission denied';
+                } else if (locStatus == GpsStatus.unavailable) {
+                  accValue = 'GPS disabled';
+                } else if (accuracy != null && accuracy > 0) {
+                  accValue = '+/- ${accuracy.toStringAsFixed(1)} m';
+                } else {
+                  accValue = 'Waiting...';
+                }
+
+                String altValue;
+                if (locStatus == GpsStatus.loading) {
+                  altValue = 'Loading...';
+                } else if (locStatus != GpsStatus.available) {
+                  altValue = 'Unavailable';
+                } else if (altitude != null) {
+                  altValue = '${altitude.toStringAsFixed(0)} m';
+                } else {
+                  altValue = 'Unavailable';
+                }
+
+                String speedValue;
+                if (locStatus == GpsStatus.loading) {
+                  speedValue = 'Loading...';
+                } else if (locStatus != GpsStatus.available ||
+                    speed == null || speed < 0) {
+                  speedValue = 'Unavailable';
+                } else {
+                  speedValue =
+                      '${(speed * 3.6).toStringAsFixed(1)} km/h';
+                }
+
+                String latLngValue;
+                if (pos != null && locStatus == GpsStatus.available) {
+                  latLngValue =
+                      '${pos.latitude.toStringAsFixed(6)}, ${pos.longitude.toStringAsFixed(6)}';
+                } else if (locStatus == GpsStatus.loading) {
+                  latLngValue = 'Loading...';
+                } else if (locStatus == GpsStatus.permissionDenied) {
+                  latLngValue = 'Permission denied';
+                } else if (locStatus == GpsStatus.unavailable) {
+                  latLngValue = 'GPS disabled';
+                } else {
+                  latLngValue = 'Unavailable';
+                }
+
+                return GridView.count(
+                  crossAxisCount: 2,
+                  crossAxisSpacing: 12,
+                  mainAxisSpacing: 12,
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  childAspectRatio: 1.5,
+                  children: [
+                    SensorMetric(
+                      icon: Icons.my_location_rounded,
+                      label: 'GPS accuracy',
+                      value: accValue,
+                    ),
+                    SensorMetric(
+                      icon: Icons.landscape_rounded,
+                      label: 'Elevation',
+                      value: altValue,
+                    ),
+                    SensorMetric(
+                      icon: Icons.speed_rounded,
+                      label: 'Speed',
+                      value: speedValue,
+                    ),
+                    SensorMetric(
+                      icon: Icons.pin_drop_outlined,
+                      label: 'Position',
+                      value: latLngValue,
+                      valueFontSize: 12,
+                    ),
+                  ],
+                );
+              },
             ),
-            const SizedBox(height: 16),
-            Card(
-              child: ListTile(
-                contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 18,
-                  vertical: 8,
-                ),
-                leading: const Icon(
-                  Icons.flashlight_on_rounded,
-                  color: Color(0xFFC58B26),
-                ),
-                title: const Text(
-                  'Flashlight',
-                  style: TextStyle(fontWeight: FontWeight.w800),
-                ),
-                subtitle: const Text('Quick access when visibility is low'),
-                trailing: Switch(value: false, onChanged: (_) {}),
-              ),
+            const SizedBox(height: 12),
+            ListenableBuilder(
+              listenable: deviceSensors,
+              builder: (context, _) {
+                final isAvailable = deviceSensors.flashlightStatus ==
+                    SensorStatus.available;
+                final isOn = deviceSensors.isFlashlightOn;
+                return Card(
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 18,
+                      vertical: 8,
+                    ),
+                    leading: const Icon(
+                      Icons.flashlight_on_rounded,
+                      color: Color(0xFFC58B26),
+                    ),
+                    title: const Text(
+                      'Flashlight',
+                      style: TextStyle(fontWeight: FontWeight.w800),
+                    ),
+                    subtitle: Text(
+                      isAvailable
+                          ? (isOn ? 'On' : 'Off')
+                          : 'Not available on this device',
+                    ),
+                    trailing: Switch(
+                      value: isOn,
+                      onChanged: isAvailable
+                          ? (_) => deviceSensors.toggleFlashlight()
+                          : null,
+                    ),
+                  ),
+                );
+              },
             ),
           ],
         ),
@@ -1874,111 +1898,34 @@ class SectionTitle extends StatelessWidget {
   );
 }
 
-class LibraryItem extends StatelessWidget {
-  const LibraryItem({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    required this.color,
-    this.onDelete,
-    super.key,
-  });
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final Color color;
-  final VoidCallback? onDelete;
-  @override
-  Widget build(BuildContext context) => Card(
-    child: ListTile(
-      contentPadding: const EdgeInsets.all(16),
-      leading: Container(
-        width: 46,
-        height: 46,
-        decoration: BoxDecoration(
-          color: color.withValues(alpha: 0.13),
-          borderRadius: BorderRadius.circular(15),
-        ),
-        child: Icon(icon, color: color),
-      ),
-      title: Text(title, style: const TextStyle(fontWeight: FontWeight.w800)),
-      subtitle: Text(subtitle),
-      trailing: onDelete == null
-          ? const Icon(Icons.more_horiz_rounded)
-          : IconButton(
-              onPressed: onDelete,
-              icon: const Icon(Icons.delete_outline_rounded),
-              tooltip: 'Remove document',
-            ),
-    ),
-  );
-}
-
-class EmptyDocumentState extends StatelessWidget {
-  const EmptyDocumentState({required this.onImport, super.key});
-
-  final VoidCallback onImport;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      color: const Color(0xFFE2F0E4),
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Icon(
-              Icons.picture_as_pdf_outlined,
-              color: Color(0xFF2A5D4A),
-              size: 30,
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'Bring your own local knowledge.',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800),
-            ),
-            const SizedBox(height: 4),
-            const Text(
-              'Import a PDF. resQ copies it into private app storage and keeps it available offline.',
-              style: TextStyle(color: Color(0xFF466253), height: 1.35),
-            ),
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: onImport,
-              icon: const Icon(Icons.add_rounded),
-              label: const Text('Import PDF'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class SensorMetric extends StatelessWidget {
   const SensorMetric({
     required this.icon,
     required this.label,
     required this.value,
+    this.valueFontSize = 16,
     super.key,
   });
   final IconData icon;
   final String label;
   final String value;
+  final double valueFontSize;
   @override
   Widget build(BuildContext context) => Card(
     child: Padding(
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
           Icon(icon, color: const Color(0xFF2A5D4A), size: 19),
           const SizedBox(height: 7),
-          Text(
-            value,
-            style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 16),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              value,
+              style: TextStyle(fontWeight: FontWeight.w800, fontSize: valueFontSize),
+            ),
           ),
           Text(
             label,
@@ -2001,64 +1948,4 @@ class _ChatMessage {
       isAssistant: isAssistant,
     );
   }
-}
-
-String _documentStatus(LocalDocument document) {
-  return switch (document.indexState) {
-    DocumentIndexState.pending => 'Waiting to index',
-    DocumentIndexState.indexing => 'Indexing local text',
-    DocumentIndexState.ready => 'Ready for search',
-    DocumentIndexState.needsOcr => 'OCR needed',
-    DocumentIndexState.failed => 'Could not read PDF',
-  };
-}
-
-String _indexMessage(LocalDocument document) {
-  return switch (document.indexState) {
-    DocumentIndexState.pending || DocumentIndexState.indexing =>
-      '${document.name} is indexing its local text. Try again in a moment.',
-    DocumentIndexState.ready =>
-      '${document.name} is ready for offline document search.',
-    DocumentIndexState.needsOcr =>
-      '${document.name} has no selectable text. Offline OCR is needed before resQ can search it.',
-    DocumentIndexState.failed =>
-      'resQ could not read ${document.name}. The PDF may be protected or malformed.',
-  };
-}
-
-String _generalPrompt(String question) =>
-    '''
-Answer the following question as a helpful offline assistant. Be concise and clear.
-
-Question: $question
-''';
-
-String _groundedPrompt({
-  required String question,
-  required List<DocumentSearchHit> hits,
-}) {
-  final context = hits
-      .map((hit) => '[Page ${hit.section.pageNumber}]\n${hit.section.text}')
-      .join('\n\n');
-  return '''
-Retrieved document context:
-$context
-
-Question: $question
-
-Answer only from the retrieved context. Cite supporting pages in square brackets, such as [Page 4]. If the context is insufficient, say so clearly.
-''';
-}
-
-String _formatBytes(int byteCount) {
-  const bytesInKilobyte = 1024;
-  const bytesInMegabyte = bytesInKilobyte * 1024;
-
-  if (byteCount >= bytesInMegabyte) {
-    return '${(byteCount / bytesInMegabyte).toStringAsFixed(1)} MB';
-  }
-  if (byteCount >= bytesInKilobyte) {
-    return '${(byteCount / bytesInKilobyte).toStringAsFixed(1)} KB';
-  }
-  return '$byteCount B';
 }

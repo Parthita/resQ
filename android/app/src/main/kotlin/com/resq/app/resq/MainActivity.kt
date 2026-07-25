@@ -1,7 +1,11 @@
 package com.resq.app.resq
 
+import android.content.Context
 import android.content.Intent
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.os.Build
+import android.os.PowerManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -26,12 +30,62 @@ class MainActivity : FlutterActivity() {
         localFilePickerChannel = LocalFilePickerChannel(this, filePicker)
         filePicker.setMethodCallHandler(localFilePickerChannel)
 
-        MethodChannel(
+        val platformChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "resq.platform",
-        ).setMethodCallHandler { call, result ->
-            if (call.method == "androidSdk") result.success(Build.VERSION.SDK_INT)
-            else result.notImplemented()
+        )
+        platformChannel.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "androidSdk" -> result.success(Build.VERSION.SDK_INT)
+                "isPowerSaveMode" -> result.success(isPowerSaveMode())
+                "isFlashlightAvailable" -> result.success(isFlashlightAvailable())
+                "flashlightOn" -> {
+                    setFlashlight(true)
+                    result.success(true)
+                }
+                "flashlightOff" -> {
+                    setFlashlight(false)
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    private fun isPowerSaveMode(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return pm.isPowerSaveMode
+    }
+
+    private fun isFlashlightAvailable(): Boolean {
+        return try {
+            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            for (id in cameraManager.cameraIdList) {
+                val chars = cameraManager.getCameraCharacteristics(id)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
+                    if (hasFlash == true) return true
+                }
+            }
+            false
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun setFlashlight(on: Boolean) {
+        try {
+            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            for (id in cameraManager.cameraIdList) {
+                val chars = cameraManager.getCameraCharacteristics(id)
+                val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                    cameraManager.setTorchMode(id, on)
+                    return
+                }
+            }
+        } catch (_: Exception) {
         }
     }
 

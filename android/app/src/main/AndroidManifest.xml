@@ -4,7 +4,13 @@
     <!-- Legacy Bluetooth permissions (pre-Android 12) -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+
+    <!-- GPS location (all API levels) -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- Flashlight -->
+    <uses-permission android:name="android.permission.CAMERA" android:maxSdkVersion="30" />
 
     <!-- Android 12+ (API 31+) Bluetooth permissions -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"

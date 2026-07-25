@@ -7,14 +7,14 @@ environment:
   sdk: ^3.12.0
 
 dependencies:
+  battery_plus: ^6.1.1
   bluetooth_low_energy: ^6.2.1
   cryptography: ^2.9.0
   flutter:
     sdk: flutter
-  path_provider: ^2.1.6
-  pdfrx: ^2.4.7
+  geolocator: ^13.0.2
   permission_handler: ^12.0.3
-  shared_preferences: ^2.5.5
+  sensors_plus: ^6.1.1
   yjs_dart: ^1.1.15
 
 dev_dependencies:

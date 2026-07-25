@@ -483,6 +483,34 @@ class MeshController {
     await tunnel.broadcastUpdate();
   }
 
+  /// Broadcast an SOS alert over the mesh.
+  ///
+  /// Uses the existing personal-message envelope with `kind: 'sos'` so every
+  /// resQ peer receives it.  If [latitude] and [longitude] are available they
+  /// are included; otherwise the SOS is sent without coordinates.
+  /// Returns `true` when the packet was handed to the router, `false` if the
+  /// mesh has not been started yet.
+  Future<bool> sendSos({double? latitude, double? longitude}) async {
+    if (!isStarted) return false;
+    final body = <String, dynamic>{
+      'kind': 'sos',
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    };
+    if (latitude != null && longitude != null) {
+      body['lat'] = latitude;
+      body['lon'] = longitude;
+    }
+    final packet = BitchatPacket(
+      type: MessageType.personal.value,
+      senderId: identity.senderId,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: Uint8List.fromList(utf8.encode(jsonEncode(body))),
+      ttl: 3,
+    );
+    await router.broadcast(await identity.signPacket(packet));
+    return true;
+  }
+
   void _setState(MeshState s) {
     _state = s;
     _stateController.add(s);
