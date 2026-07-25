@@ -14,6 +14,12 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.resq.app.resq"
@@ -39,8 +45,8 @@ android {
                     "-DLLAMA_BUILD_COMMON=ON",
                     "-DLLAMA_OPENSSL=OFF",
                     "-DGGML_NATIVE=OFF",
-                    "-DGGML_BACKEND_DL=OFF",
-                    "-DGGML_CPU_ALL_VARIANTS=OFF",
+                    "-DGGML_BACKEND_DL=ON",
+                    "-DGGML_CPU_ALL_VARIANTS=ON",
                     "-DGGML_LLAMAFILE=OFF",
                 )
             }
