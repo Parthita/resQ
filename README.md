@@ -1,210 +1,233 @@
-resQ
+# resQ
 
-resQ is an offline-first emergency communication and coordination platform designed for situations where internet access, mobile networks, or central servers are unavailable.
+> Offline-first emergency communication powered by Bluetooth Mesh and on-device AI.
 
-The app enables nearby devices to form a Bluetooth Low Energy mesh network, allowing users to communicate, coordinate, and share critical information without relying on existing communication infrastructure. It also integrates on-device AI so assistance remains available even when completely offline.
+resQ is an Android application that enables communication during disasters, remote travel, or situations where internet and cellular networks are unavailable. It creates a Bluetooth Low Energy (BLE) mesh network between nearby devices, allowing messages, SOS alerts, and shared information to travel across multiple hops without requiring servers or cloud infrastructure.
+
+The app also integrates an on-device AI assistant using **llama.cpp**, allowing users to access AI capabilities completely offline while keeping their data private.
 
 ---
 
-Features
+## Features
 
-Bluetooth Mesh Communication
+### Bluetooth Mesh Networking
 
-- Decentralized Bluetooth Low Energy mesh networking
-- Multi-hop message relay using flood routing
 - Automatic peer discovery
-- Direct messaging between nearby users
-- Presence announcements
-- Offline operation with no servers or internet
+- Multi-hop message relay
+- Direct messaging
+- Group communication
+- Offline operation without internet
+- Flood-routing based message propagation
 
-Emergency Features
+### Emergency Features
 
 - One-tap SOS broadcasting
 - GPS location sharing
-- Live latitude and longitude
-- Compass and heading
-- Battery and power saver status
+- Nearby device discovery
+- Live battery status
+- Compass
 - Flashlight control
-- Sensor dashboard
+- Device sensor dashboard
 
-Offline AI
+### Offline AI
 
-- Fully on-device inference using llama.cpp
-- User-imported GGUF models
+- On-device inference using **llama.cpp**
+- Supports GGUF models
 - Streaming responses
 - No cloud APIs
-- No internet required
-- Privacy-first inference
+- Fully offline
+- Privacy-first AI assistant
 
-Shared Coordination
+### Collaboration
 
-- Conflict-free offline synchronization using Yjs CRDTs
-- Automatic state convergence after reconnection
-- Reliable chunked document resynchronization
-- Persistent shared rescue information
+- CRDT-based offline synchronization
+- Shared notes and rescue coordination
+- Automatic conflict resolution
+- Eventual consistency between devices
 
-Security
+### Security
 
-- X25519 identity keys
-- Ed25519 packet signing
-- Secure key storage using Android Keystore
-- Privacy-focused Bluetooth advertising
+- Secure local identity
+- Packet signing
+- Encrypted local key storage
+- No user data stored on servers
 
 ---
 
-Technology Stack
+## Technology Stack
 
-Frontend
+### Frontend
 
 - Flutter
 - Dart
 
-Native Android
+### Native Android
 
 - Kotlin
 - Android MethodChannels
 - JNI
 
-AI
+### AI
 
 - llama.cpp
-- GGUF models
+- GGUF
 - GGML
 - OpenMP
-- ARM CPU runtime optimizations
 
-Networking
+### Networking
 
-- Bluetooth Low Energy
-- GATT Central + Peripheral
-- Flood Routing
-- CRDT Synchronization (Yjs)
+- Bluetooth Low Energy (BLE)
+- GATT Central
+- GATT Peripheral
+- Multi-hop Mesh Routing
 
-Security
+### Synchronization
 
-- X25519
-- Ed25519
-- SHA-256
-- Flutter Secure Storage
+- Yjs CRDT
 
-Device Integration
+### Device Integration
 
 - Geolocator
 - Sensors Plus
 - Battery Plus
 - Permission Handler
 
----
+### Security
 
-Architecture
-
-Flutter UI
-      │
-      ▼
-MeshController
-      │
- ┌───────────────┬────────────────┐
- │               │                │
- ▼               ▼                ▼
-BLE Mesh      AI Engine       Device Services
- │             │               │
- ▼             ▼               ▼
-Bluetooth   llama.cpp      GPS / Compass /
-Mesh        (GGUF)         Battery / Sensors
+- X25519
+- Ed25519
+- SHA-256
+- Flutter Secure Storage
 
 ---
 
-How It Works
+## Architecture
 
-1. Users install resQ on nearby Android devices.
-2. Devices automatically discover one another using Bluetooth Low Energy.
-3. A decentralized mesh network forms without requiring internet access.
-4. Messages, SOS alerts, and shared rescue information propagate through nearby devices using multi-hop routing.
-5. The on-device AI assistant continues working entirely offline using a locally imported GGUF model.
-
----
-
-Current Status
-
-Implemented:
-
-- Bluetooth mesh networking
-- Peer discovery
-- Multi-hop routing
-- Direct messaging
-- SOS broadcasting
-- GPS location sharing
-- Live sensor dashboard
-- Offline AI with llama.cpp
-- GGUF model import
-- Streaming AI responses
-- CRDT-based shared synchronization
-- Android native optimizations
-- Secure identity management
-
-In Progress:
-
-- End-to-end encryption
-- Reliable delivery for all mesh messages
-- Background execution improvements
-- Persistent chat history
-- Media and file sharing
+```text
+                 Flutter UI
+                      │
+        ┌─────────────┴─────────────┐
+        │                           │
+        ▼                           ▼
+ Bluetooth Mesh               AI Assistant
+        │                           │
+        ▼                           ▼
+ Mesh Controller            llama.cpp (JNI)
+        │                           │
+        ▼                           ▼
+ Bluetooth LE              Local GGUF Model
+        │
+        ▼
+ Nearby Devices
+```
 
 ---
 
-Running the Project
+## Project Structure
 
-Prerequisites
+```text
+lib/
+├── core/
+│   ├── ai/
+│   ├── bluetooth/
+│   ├── mesh/
+│   ├── services/
+│   └── models/
+├── screens/
+├── widgets/
+└── main.dart
+
+android/
+└── Native Android
+    ├── Kotlin
+    ├── JNI
+    └── llama.cpp
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
 
 - Flutter SDK
 - Android SDK
 - Android NDK
 - CMake
-- Android device running Android 11 (API 30) or later
+- Android device running Android 11 or later
 
-Build
+### Clone the Repository
 
+```bash
+git clone <repository-url>
+cd resQ
+```
+
+### Install Dependencies
+
+```bash
 flutter pub get
-flutter run -d <device_id>
+```
 
-or build a debug APK:
+### Run the Application
 
-flutter build apk --debug
+```bash
+flutter run
+```
+
+### Build Release APK
+
+```bash
+flutter build apk --release
+```
 
 ---
 
-Permissions
+## Permissions
 
-resQ requests only the permissions required for its offline functionality:
+The application requests only the permissions required for offline communication and emergency features.
 
 - Bluetooth Scan
 - Bluetooth Connect
 - Bluetooth Advertise
 - Fine Location
 - Coarse Location
-- Camera (flashlight control)
+- Camera (Flashlight)
 
 ---
 
-Supported Platform
+## Supported Platform
 
-- Android (Primary platform)
+| Platform | Status |
+|----------|--------|
+| Android | ✅ Supported |
+| iOS | 🚧 Planned |
+| Web | ❌ Not Supported |
+| Windows | ❌ Not Supported |
+| Linux | Development Only |
+| macOS | ❌ Not Supported |
 
 ---
 
-Roadmap
+## Roadmap
 
 - End-to-end encrypted messaging
-- Reliable acknowledgements for all mesh packets
-- Persistent chat database
-- Media and file transfer
-- Group conversations
-- Offline OCR for scanned documents
+- Reliable message acknowledgements
+- Media and file sharing over mesh
+- Improved background mesh networking
+- Offline OCR
 - Expanded AI capabilities
-- Improved battery optimisation
+- Battery optimisations
+- Cross-platform support
 
 ---
 
-License
+## Contributing
 
-This project is developed for research, experimentation, and hackathon participation. Licensing will be defined before public release.
+Contributions are welcome. Please open an issue before submitting major feature changes so they can be discussed first.
+
+---
+
+## License
+
+This project was developed as part of a hackathon and is currently intended for research and educational purposes.
