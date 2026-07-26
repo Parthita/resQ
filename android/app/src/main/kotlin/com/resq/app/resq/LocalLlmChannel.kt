@@ -177,7 +177,7 @@ class LocalLlmChannel(
         scope.launch {
             try {
                 val engine = awaitEngine()
-                engine.abortGeneration()
+                engine.cancelGeneration()
             } catch (_: Exception) { }
         }
         result.success(null)

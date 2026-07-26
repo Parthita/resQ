@@ -113,6 +113,7 @@ class MeshController {
   Stream<IncomingSos> get sosStream => _sosController.stream;
   List<PersonalMessage> messagesFor(String contactId) =>
       List.unmodifiable(_messages[contactId] ?? const []);
+  int messagesCount(String contactId) => _messages[contactId]?.length ?? 0;
 
   /// Request BLE permissions AND verify the Bluetooth adapter is on.
   /// Returns a [MeshPermissionResult] so the UI can tell the user exactly what
