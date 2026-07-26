@@ -55,6 +55,9 @@ class BleLink implements BitchatLink {
   GATTCharacteristic? _centralChar;
   Peripheral? _centralPeripheral;
   final List<Central> _subscribedCentrals = [];
+  bool _channelWasReady = false;
+  final StreamController<void> _channelReady =
+      StreamController<void>.broadcast();
   bool _advertising = false;
   bool _scanning = false;
   Timer? _scanHeartbeat;
@@ -73,6 +76,36 @@ class BleLink implements BitchatLink {
 
   @override
   Stream<LinkPeer> get peers => _peersController.stream;
+
+  /// Fires when a peer's GATT data channel is actually usable for sending.
+  /// The mesh waits for this before pushing the full-doc CRDT resync so the
+  /// push doesn't land in the dead window (subscribers=0 / no central link)
+  /// that exists between `connected=true` and the notify/write channel being
+  /// established.
+  @override
+  Stream<void> get channelReady => _channelReady.stream;
+
+  /// True when this device can currently put bytes on the wire to a peer:
+  /// either a central has subscribed to our notify characteristic (peripheral
+  /// role) or we hold a discovered characteristic on a connected peripheral
+  /// (central role).
+  bool get _canSendNow =>
+      _subscribedCentrals.isNotEmpty ||
+      (_centralPeripheral != null && _centralChar != null);
+
+  void _notifyChannelReady() {
+    // Reset on every disconnect so a NEW reconnect re-signals channelReady
+    // and the mesh re-pushes the CRDT doc. Without this, the first reconnect
+    // in a mesh session is the only one that resyncs; later reconnects would
+    // await channelReady.first forever and silently skip the resync.
+    if (!_canSendNow) {
+      _channelWasReady = false;
+      return;
+    }
+    if (_channelWasReady) return;
+    _channelWasReady = true;
+    if (!_channelReady.isClosed) _channelReady.add(null);
+  }
 
   @override
   bool get isPoweredOn => _central.state == BluetoothLowEnergyState.poweredOn;
@@ -107,6 +140,7 @@ class BleLink implements BitchatLink {
         if (args.state == ConnectionState.disconnected) {
           _connecting.remove(id);
           _connected.remove(id);
+          _channelWasReady = false;
           if (identical(_centralPeripheral, args.peripheral)) {
             _centralPeripheral = null;
             _centralChar = null;
@@ -134,6 +168,7 @@ class BleLink implements BitchatLink {
         if (args.state == ConnectionState.disconnected) {
           _subscribedCentrals.remove(args.central);
           _inboundCentrals.remove(id);
+          _channelWasReady = false;
         }
         if (!_peersController.isClosed) {
           _peersController.add(
@@ -181,6 +216,7 @@ class BleLink implements BitchatLink {
         if (args.state) {
           _subscribedCentrals.add(args.central);
           debugPrint('[bitchat:ble] central subscribed ${args.central.uuid}');
+          _notifyChannelReady();
           // A central has completed the GATT notify subscription.  This is the
           // first moment the peripheral can reliably send a packet back, so
           // surface a fresh connected event for the controller to announce its
@@ -476,6 +512,7 @@ class BleLink implements BitchatLink {
       await _central.setCharacteristicNotifyState(peripheral, ch, state: true);
       _centralPeripheral = peripheral;
       _centralChar = ch;
+      _notifyChannelReady();
       _connected[id] = peripheral;
       if (!_peersController.isClosed) {
         _peersController.add(

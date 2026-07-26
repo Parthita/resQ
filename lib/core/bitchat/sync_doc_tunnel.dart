@@ -171,7 +171,7 @@ class SyncDocTunnel {
 
   /// Pre-declare the named types used by the chat on the local doc. Idempotent
   /// (the YArray/YMap are created lazily and observe is wired only once).
-  void declareDefaultTypes() {
+  Future<void> declareDefaultTypes() async {
     if (_typesReady) return;
     // legacy text channel (docName) MUST be declared before any update is
     // applied, or yjs_dart instantiates it as a YMap and getText() throws.
@@ -179,10 +179,30 @@ class SyncDocTunnel {
     messages = doc.getArray('messages')!;
     presence = doc.getMap('presence')!;
     personalMessages = doc.getArray('personal_messages')!;
-    messages.observe((_, _) => _changed.add(null));
-    presence.observe((_, _) => _changed.add(null));
-    personalMessages.observe((_, _) => _changed.add(null));
+    // Persist on every local/remote mutation so a restart (or long BLE gap)
+    // restores the full chat history. observe fires for both sides; the
+    // actual file write is coalesced by _schedulePersist. The disk hydrate
+    // itself happens once in load() before the router starts delivering.
+    messages.observe((_, _) {
+      _changed.add(null);
+      _schedulePersist();
+    });
+    presence.observe((_, _) {
+      _changed.add(null);
+      _schedulePersist();
+    });
     _typesReady = true;
+  }
+
+  Timer? _persistTimer;
+
+  /// Coalesce rapid mutations (e.g. a burst of incoming fragments) into one
+  /// file write per ~500ms instead of one write per update.
+  void _schedulePersist() {
+    _persistTimer?.cancel();
+    _persistTimer = Timer(const Duration(milliseconds: 500), () {
+      unawaited(_persist());
+    });
   }
 
   /// Convenience: get the synced text type (declare it if missing).
@@ -305,6 +325,7 @@ class SyncDocTunnel {
   }
 
   Future<void> stop() async {
+    _persistTimer?.cancel();
     await router.stop();
     await _changed.close();
     await _deliveredDoc.close();

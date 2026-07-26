@@ -32,6 +32,16 @@ class MeshController {
   final bool useMainnet;
   final BitchatLink? _preferredLink;
 
+  /// User-facing nickname broadcast in the BitChat announce (TLV 0x01) and
+  /// personal-connection envelopes. Additive: when unset (or empty) we keep
+  /// the historical default 'resQ' so existing behavior is unchanged until the
+  /// UI provides a value. Set this from the UI before start() if persistence
+  /// is desired.
+  String? _nickname;
+  set nickname(String? value) => _nickname = value;
+  String get displayName =>
+      (_nickname != null && _nickname!.isNotEmpty) ? _nickname! : 'resQ';
+
   /// Lazily created. We must NOT construct BleLink (which instantiates
   /// CentralManager/PeripheralManager) in the constructor: those throw
   /// UnimplementedError off-device, and on-device we only want to pay the cost
@@ -236,12 +246,13 @@ class MeshController {
     }
     _peerController.add(List.of(_peers));
     if (p.connected && isStarted) {
-      // Startup announcements commonly happen before GATT notification/write
-      // channels are ready. Repeat after each real link establishment so the
-      // other phone can become a visible resQ person.
+      // Startup announcements commonly happen before the GATT notify/write
+      // channel is ready. Announce early (it's small and retried), but defer
+      // the full-doc CRDT resync + accept/response replay until the channel is
+      // actually usable, otherwise the resync bytes are dropped (subscribers=0)
+      // and the offline peer never catches up.
       unawaited(_announce());
-      unawaited(_resyncDocumentAfterLink());
-      unawaited(_replayPendingRequests());
+      unawaited(_syncAfterChannelReady());
       _setAcceptedContactsLinkState(true);
     }
     // A physical link loss makes every accepted conversation unavailable. The
@@ -261,6 +272,24 @@ class MeshController {
     if (_peers.length != countBefore) _peerController.add(List.of(_peers));
   }
 
+  /// Wait for the GATT data channel to be actually usable, then push the
+  /// full-doc CRDT resync and replay any pending accept/response envelopes.
+  ///
+  /// The resync must not fire on the early `connected=true` peer event: at that
+  /// instant the notify/write channel isn't established yet, so the bytes are
+  /// dropped (subscribers=0) and an offline peer never catches up. Gating on
+  /// [BitchatLink.channelReady] removes that race at the source.
+  Future<void> _syncAfterChannelReady() async {
+    try {
+      await link.channelReady.first.timeout(const Duration(seconds: 4));
+    } on TimeoutException {
+      debugPrint('[resq:mesh] channel-ready wait timed out; resyncing anyway');
+    }
+    if (!isStarted) return;
+    unawaited(_resyncDocumentAfterLink());
+    unawaited(_replayPendingRequests());
+  }
+
   Future<void> _replayPendingRequests() async {
     if (_replayingRequests) {
       debugPrint('[resq:mesh] request replay skipped (already running)');
@@ -270,19 +299,22 @@ class MeshController {
     try {
       for (final contact in List<PersonalContact>.of(_contacts.values)) {
         try {
-          if (contact.status == ConnectionStatus.outgoingPending) {
-            debugPrint('[resq:mesh] replay pending request to=${contact.id}');
-            await _sendEnvelope(
-              {'kind': 'request', 'name': 'resQ'},
-              recipient: contact.id,
-            ).timeout(const Duration(seconds: 12));
-          } else if (contact.accepted) {
-            debugPrint('[resq:mesh] replay accepted response to=${contact.id}');
-            await _sendEnvelope(
-              {'kind': 'response', 'accepted': true, 'name': 'resQ'},
-              recipient: contact.id,
-            ).timeout(const Duration(seconds: 12));
-          }
+          // Only replay for contacts that are still PENDING a handshake. A
+          // contact already connected (the normal request/response path set
+          // status=connected) needs no replay — re-sending a 'response' there
+          // just blocks on a send that the peer never answers, hitting the
+          // 12s timeout and dumping "request replay failed". (See PID 14763.)
+          final needsReplay = contact.status == ConnectionStatus.outgoingPending ||
+              contact.status == ConnectionStatus.incomingPending;
+          if (!needsReplay) continue;
+          final kind = contact.status == ConnectionStatus.outgoingPending
+              ? 'request'
+              : 'response';
+          debugPrint('[resq:mesh] replay pending $kind to=${contact.id}');
+          await _sendEnvelope(
+            {'kind': kind, 'accepted': true, 'name': displayName},
+            recipient: contact.id,
+          ).timeout(const Duration(seconds: 12));
         } on Object catch (error, stackTrace) {
           debugPrint(
             '[resq:mesh] request replay failed contact=${contact.id}: $error\n$stackTrace',
@@ -342,7 +374,7 @@ class MeshController {
       senderId: identity.senderId,
       timestamp: DateTime.now().millisecondsSinceEpoch,
       payload: TlvAnnounce(
-        nickname: 'resQ',
+        nickname: displayName,
         noisePublicKey: identity.noisePublicKey,
         signingPublicKey: identity.signingPublicKey,
       ).encode(),
@@ -370,7 +402,7 @@ class MeshController {
     _emitContacts();
     await _sendEnvelope({
       'kind': 'request',
-      'name': 'resQ',
+      'name': displayName,
     }, recipient: contact.id);
   }
 
@@ -392,7 +424,7 @@ class MeshController {
     await _sendEnvelope({
       'kind': 'response',
       'accepted': accept,
-      'name': 'resQ',
+      'name': displayName,
     }, recipient: contact.id);
   }
 
@@ -530,7 +562,7 @@ class MeshController {
               _sendEnvelope({
                 'kind': 'response',
                 'accepted': true,
-                'name': 'resQ',
+                'name': displayName,
               }, recipient: sender),
             );
           } else if (contact.status != ConnectionStatus.connected) {

@@ -53,6 +53,14 @@ abstract class BitchatLink {
   /// whether the mesh can start).
   bool get isPoweredOn;
 
+  /// Fires when a peer's GATT data channel is actually usable for sending
+  /// (peripheral role: a central subscribed to our notify characteristic;
+  /// central role: we've discovered the peer's characteristic and are ready to
+  /// write). The mesh waits for this before pushing the full-doc CRDT resync,
+  /// because firing on the earlier `connected=true` peer event drops the bytes
+  /// (subscribers=0 / no central link) — the channel isn't ready yet.
+  Stream<void> get channelReady;
+
   /// Send raw bytes to peers. Returns true if the link accepted the frame.
   Future<bool> send(Uint8List frame);
 
@@ -76,6 +84,8 @@ class MockBitchatLink implements BitchatLink {
       StreamController<Uint8List>.broadcast();
   final StreamController<LinkPeer> _peerController =
       StreamController<LinkPeer>.broadcast();
+  final StreamController<void> _channelReady =
+      StreamController<void>.broadcast();
   final List<MockBitchatLink> _peers = [];
   bool _started = false;
 
@@ -92,6 +102,9 @@ class MockBitchatLink implements BitchatLink {
 
   @override
   Stream<LinkPeer> get peers => _peerController.stream;
+
+  @override
+  Stream<void> get channelReady => _channelReady.stream;
 
   @override
   bool get isPoweredOn => true;
@@ -121,6 +134,7 @@ class MockBitchatLink implements BitchatLink {
       _peerController.add(LinkPeer(id: peer.label, connected: true));
       peer._peerController.add(LinkPeer(id: label, connected: true));
     }
+    _channelReady.add(null);
   }
 
   @override

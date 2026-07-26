@@ -8,6 +8,7 @@ import 'core/local_llm_service.dart';
 import 'core/location_service.dart';
 import 'core/model_store.dart';
 import 'core/bitchat/ble_link.dart';
+import 'core/nickname_store.dart';
 import 'mesh_controller.dart';
 import 'personal_chat_screen.dart';
 
@@ -100,6 +101,14 @@ class _ResQShellState extends State<ResQShell> {
   void initState() {
     super.initState();
     _mesh = MeshController();
+    // Load persisted nickname so the mesh broadcasts the user's chosen name
+    // instead of the default 'resQ'. Non-blocking; if unset, the controller
+    // keeps its 'resQ' fallback and behavior is unchanged.
+    unawaited(
+      NicknameStore.load().then((saved) {
+        if (saved != null && saved.isNotEmpty) _mesh.nickname = saved;
+      }),
+    );
     _battery = BatteryService();
     _location = LocationService();
     _deviceSensors = DeviceSensorService();
@@ -984,6 +993,31 @@ class _PeopleScreenState extends State<PeopleScreen> {
   bool _btOff = false;
   List<MeshPeer> _peerList = const [];
 
+  /// Collapse raw MeshPeers that share a verified resQ senderId
+  /// (identityHint) into a single row. Prefer the connected, named entry.
+  List<MeshPeer> _coalescePeers(List<MeshPeer> peers) {
+    final byIdentity = <String, MeshPeer>{};
+    for (final peer in peers) {
+      final key = peer.identityHint ?? peer.id;
+      final existing = byIdentity[key];
+      if (existing == null) {
+        byIdentity[key] = peer;
+      } else {
+        // keep the most informative: connected over not, named over raw uuid
+        byIdentity[key] = MeshPeer(
+          id: existing.identityHint ?? existing.id,
+          nickname: existing.connected
+              ? existing.nickname
+              : peer.nickname,
+          lastSeen: peer.lastSeen,
+          identityHint: existing.identityHint ?? peer.identityHint,
+          connected: existing.connected || peer.connected,
+        );
+      }
+    }
+    return byIdentity.values.toList();
+  }
+
   @override
   void initState() {
     super.initState();
@@ -1085,6 +1119,44 @@ class _PeopleScreenState extends State<PeopleScreen> {
     }
   }
 
+  Future<void> _editNickname() async {
+    final controller = TextEditingController(
+      text: widget.mesh.displayName == 'resQ' ? '' : widget.mesh.displayName,
+    );
+    if (!mounted) return;
+    final saved = await showDialog<String?>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Your display name'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          maxLength: 32,
+          decoration: const InputDecoration(
+            hintText: 'e.g. Rescuer 2',
+            border: OutlineInputBorder(),
+          ),
+          onSubmitted: (value) => Navigator.pop(dialogContext, value),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, controller.text),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (saved == null) return;
+    final trimmed = saved.trim();
+    widget.mesh.nickname = trimmed.isEmpty ? null : trimmed;
+    await NicknameStore.save(trimmed.isEmpty ? null : trimmed);
+    if (mounted) setState(() {});
+  }
+
   @override
   Widget build(BuildContext context) {
     final isOn = _state == MeshState.running;
@@ -1117,6 +1189,11 @@ class _PeopleScreenState extends State<PeopleScreen> {
                     ),
                   ],
                 ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.edit_outlined, size: 20),
+                tooltip: 'Set your display name',
+                onPressed: _editNickname,
               ),
               StatusPill(label: statusLabel, icon: statusIcon),
             ],
@@ -1191,8 +1268,15 @@ class _PeopleScreenState extends State<PeopleScreen> {
             initialData: widget.mesh.contacts,
             builder: (context, snapshot) {
               final contacts = snapshot.data ?? const [];
+              // The BLE layer reports one MeshPeer per peripheral.uuid, and a
+              // real resQ device opens BOTH an inbound and an outbound GATT
+              // link (two different uuids) plus a rotating scan MAC. They all
+              // collapse to ONE person once the signed announce verifies and
+              // stamps identityHint (=resQ senderId). Coalesce here so the UI
+              // shows a single row per real peer instead of 2-3 duplicate
+              // "resQ" entries. (See the 3uuid->1identity logs.)
               final rawPeers = contacts.isEmpty
-                  ? _peerList
+                  ? _coalescePeers(_peerList)
                   : const <MeshPeer>[];
               if (contacts.isNotEmpty || rawPeers.isNotEmpty) {
                 return Column(
