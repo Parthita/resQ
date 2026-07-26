@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'dart:io';
@@ -220,7 +222,19 @@ class SyncDocTunnel {
   }
 
   void _onDelivered(BitchatPacket packet) {
-    if (packet.type != MessageType.syncDoc.value) return;
+    if (packet.type == MessageType.syncDoc.value) {
+      _applySyncPacket(packet);
+      return;
+    }
+    if (packet.type == MessageType.syncChunk.value) {
+      _handleChunk(packet);
+      return;
+    }
+  }
+
+  /// Apply a standard full-state sync packet (legacy single-shot path, still
+  /// used for small live updates).
+  void _applySyncPacket(BitchatPacket packet) {
     // ensure the types exist on this doc before applying
     declareDefaultTypes();
     doc.transact((tr) {
@@ -305,9 +319,107 @@ class SyncDocTunnel {
             (message.senderId == peer && message.recipientId == me)) {
           out.add(message);
         }
-      } on Object {}
+      } on Object {
+        // skip a malformed entry rather than crashing the caller
+      }
     }
     return out;
+  }
+
+  /// Broadcast the current full Yjs state as a set of small, self-contained
+  /// chunks (Tier-2 reliable resync).
+  ///
+  /// Each chunk is <= [chunkSize] bytes, so after the FloodRouter fragments it
+  /// the chunk fits in a SINGLE BLE frame. A lost frame therefore costs
+  /// re-sending one small chunk, not the whole doc. The receiver reassembles
+  /// all chunks, applies the full state, and replies with a [syncAck] addressed
+  /// back to us; [MeshController] retransmits if no ack arrives.
+  ///
+  /// Idempotent: re-sending the same full state is safe (applyUpdate is
+  /// commutative/associative/idempotent), so retries never corrupt the doc.
+  Future<void> broadcastStateChunks({int chunkSize = 400}) async {
+    declareDefaultTypes();
+    final state = encodeStateAsUpdate(doc);
+    if (state.isEmpty) return;
+    final batchId = _randomBatchId();
+    final total = (state.length / chunkSize).ceil();
+    for (var index = 0; index < total; index++) {
+      final start = index * chunkSize;
+      final end = min(start + chunkSize, state.length);
+      final chunk = state.sublist(start, end);
+      final payload = BytesBuilder();
+      // seq (2 BE) | total (2 BE) | batchId (4) | data
+      payload.addByte((index >> 8) & 0xFF);
+      payload.addByte(index & 0xFF);
+      payload.addByte((total >> 8) & 0xFF);
+      payload.addByte(total & 0xFF);
+      payload.add(batchId);
+      payload.add(chunk);
+      final packet = BitchatPacket(
+        type: MessageType.syncChunk.value,
+        senderId: senderId,
+        timestamp: DateTime.now().millisecondsSinceEpoch,
+        payload: payload.toBytes(),
+        ttl: 8,
+      );
+      await router.broadcast(packet);
+    }
+  }
+
+  static Uint8List _randomBatchId() {
+    final rnd = Random.secure();
+    final b = Uint8List(4);
+    for (var i = 0; i < b.length; i++) {
+      b[i] = rnd.nextInt(256);
+    }
+    return b;
+  }
+
+  /// Per-(sender,batch) reassembly buffer for incoming chunks.
+  final Map<String, _ChunkBuffer> _chunkBuffers = {};
+
+  void _handleChunk(BitchatPacket packet) {
+    // ensure the types exist on this doc before applying the reassembled state
+    declareDefaultTypes();
+    final p = packet.payload;
+    if (p.length < 8) return; // 2+2+4 minimum header
+    final seq = (p[0] << 8) | p[1];
+    final total = (p[2] << 8) | p[3];
+    final batchId = Uint8List.sublistView(p, 4, 8);
+    final data = Uint8List.sublistView(p, 8);
+    if (total <= 0 || seq >= total) return;
+
+    final key = '${_hex(packet.senderId)}:${_hex(batchId)}';
+    final buffer = _chunkBuffers.putIfAbsent(
+      key,
+      () => _ChunkBuffer(total: total),
+    );
+    buffer.chunks[seq] = data;
+
+    if (buffer.isComplete) {
+      final full = buffer.reconstruct();
+      _chunkBuffers.remove(key);
+      if (full != null) {
+        doc.transact((tr) => applyUpdate(doc, full), this);
+        unawaited(_persist());
+        _deliveredDoc.add(docName);
+        _changed.add(null);
+        // Confirm to the sender that the full state was applied.
+        _sendSyncAck(packet.senderId);
+      }
+    }
+  }
+
+  void _sendSyncAck(Uint8List to) {
+    final packet = BitchatPacket(
+      type: MessageType.syncAck.value,
+      senderId: senderId,
+      recipientId: to,
+      timestamp: DateTime.now().millisecondsSinceEpoch,
+      payload: Uint8List(0),
+      ttl: 8,
+    );
+    unawaited(router.broadcast(packet));
   }
 
   /// Broadcast the current full-or-incremental state as a sync packet.
@@ -333,4 +445,29 @@ class SyncDocTunnel {
 
   static String _hex(Uint8List b) =>
       b.map((e) => e.toRadixString(16).padLeft(2, '0')).join();
+}
+
+/// Reassembly buffer for one batch of incoming [syncChunk] frames.
+class _ChunkBuffer {
+  _ChunkBuffer({required this.total});
+
+  final int total;
+  final Map<int, Uint8List> chunks = {};
+
+  bool get isComplete {
+    if (chunks.length < total) return false;
+    for (var i = 0; i < total; i++) {
+      if (!chunks.containsKey(i)) return false;
+    }
+    return true;
+  }
+
+  Uint8List? reconstruct() {
+    if (!isComplete) return null;
+    final out = BytesBuilder();
+    for (var i = 0; i < total; i++) {
+      out.add(chunks[i]!);
+    }
+    return out.toBytes();
+  }
 }

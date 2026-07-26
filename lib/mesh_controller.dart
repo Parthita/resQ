@@ -95,12 +95,16 @@ class MeshController {
   final _sosController = StreamController<IncomingSos>.broadcast();
   StreamSubscription<LinkPeer>? _peerSubscription;
   StreamSubscription<BitchatPacket>? _packetSubscription;
+  StreamSubscription<BitchatPacket>? _syncAckSubscription;
   StreamSubscription<void>? _docSubscription;
   Timer? _presenceTimer;
   Timer? _peerSweepTimer;
   bool _transportStarted = false;
   bool _replayingRequests = false;
   bool _resyncingDoc = false;
+  /// Resolved by [_handleSyncAck] when the peer confirms it applied our
+  /// chunked resync. Null unless a resync round is in flight.
+  Completer<void>? _resyncAckCompleter;
   final Set<String> _seenPersonalCrdtIds = <String>{};
 
   /// People discovered by the resQ protocol (not merely by a BLE scan).
@@ -189,6 +193,12 @@ class MeshController {
       _docSubscription = tunnel.changed.listen((_) => _syncPersonalMessagesFromDoc());
       await _packetSubscription?.cancel();
       _packetSubscription = router.delivered.listen(_onPacket);
+      // Tier-2: a second listener on the same broadcast stream catches the
+      // syncAck the peer sends back after applying our chunked resync. The
+      // ack confirms delivery so we don't rely on the silent `withoutResponse`
+      // BLE write succeeding.
+      await _syncAckSubscription?.cancel();
+      _syncAckSubscription = router.delivered.listen(_handleSyncAck);
       // Mark running before announcing. A BLE connection can complete while
       // startup is in progress; its callback must be able to send a presence
       // packet immediately rather than dropping it as "not started".
@@ -275,6 +285,16 @@ class MeshController {
     if (_peers.length != countBefore) _peerController.add(List.of(_peers));
   }
 
+  /// Tier-2 ack handler: the peer reply after applying our chunked resync.
+  /// Resolves the in-flight resync completer so the sender can stop retrying.
+  void _handleSyncAck(BitchatPacket packet) {
+    if (packet.type != MessageType.syncAck.value) return;
+    if (packet.recipientId == null) return;
+    if (_hex(packet.recipientId!) != myIdHex) return;
+    final completer = _resyncAckCompleter;
+    if (completer != null && !completer.isCompleted) completer.complete();
+  }
+
   /// Wait for the GATT data channel to be actually usable, then push the
   /// full-doc CRDT resync and replay any pending accept/response envelopes.
   ///
@@ -337,18 +357,39 @@ class MeshController {
     }
     _resyncingDoc = true;
     try {
-      debugPrint('[resq:mesh] CRDT resync start (full Yjs update)');
-      // Bound the send so a link that dies mid-resync (adapter power-off,
-      // peer out of range) cannot leave the underlying write hanging and this
-      // future never settling — which would wedge the guard for the rest of
-      // the session. The finally below still runs on timeout, clearing it.
-      await tunnel.broadcastUpdate().timeout(const Duration(seconds: 12));
-      debugPrint('[resq:mesh] CRDT resync complete');
-    } on TimeoutException {
-      debugPrint('[resq:mesh] CRDT resync timed out (link likely gone)');
+      debugPrint('[resq:mesh] CRDT chunked resync start');
+      // Tier-2: send the full state as small chunks and wait for the peer's
+      // syncAck. If no ack arrives (a chunk was lost on the unreliable link),
+      // retransmit the whole state — applyUpdate is idempotent, so a duplicate
+      // is harmless. Bounded retries turn "maybe it arrived" into a real
+      // delivery guarantee instead of the previous single-shot luck.
+      const maxAttempts = 3;
+      var acked = false;
+      for (var attempt = 1; attempt <= maxAttempts && !acked; attempt++) {
+        final completer = Completer<void>();
+        _resyncAckCompleter = completer;
+        try {
+          await tunnel.broadcastStateChunks().timeout(const Duration(seconds: 12));
+        } on TimeoutException {
+          debugPrint('[resq:mesh] CRDT resync send timed out (attempt $attempt)');
+        }
+        try {
+          await completer.future.timeout(const Duration(seconds: 2));
+          acked = true;
+          debugPrint('[resq:mesh] CRDT resync acked (attempt $attempt)');
+        } on TimeoutException {
+          debugPrint(
+            '[resq:mesh] CRDT resync attempt $attempt: no ack, retrying',
+          );
+        }
+      }
+      if (!acked) {
+        debugPrint('[resq:mesh] CRDT resync gave up after $maxAttempts attempts');
+      }
     } on Object catch (error, stackTrace) {
       debugPrint('[resq:mesh] CRDT resync failed: $error\n$stackTrace');
     } finally {
+      _resyncAckCompleter = null;
       _resyncingDoc = false;
       debugPrint('[resq:mesh] CRDT resync guard cleared');
     }
@@ -795,6 +836,8 @@ class MeshController {
     }
     await _packetSubscription?.cancel();
     _packetSubscription = null;
+    await _syncAckSubscription?.cancel();
+    _syncAckSubscription = null;
     await _docSubscription?.cancel();
     _docSubscription = null;
     await _peerSubscription?.cancel();

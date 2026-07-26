@@ -26,6 +26,16 @@ class MessageType {
   /// resQ's application-level invitation and direct-message envelope.
   static const personal = MessageType._(0x31);
 
+  // Tier-2 reliable resync: chunked state transfer + acknowledgement.
+  // The plain syncDoc path sends the whole Yjs doc as ONE packet that the
+  // FloodRouter fragments into 469B BLE frames; a single dropped frame over
+  // the unreliable `withoutResponse` link silently fails the reassembly and
+  // the peers diverge. syncChunk splits the state into small (<=400B) frames
+  // so each is a single BLE fragment, and syncAck lets the sender confirm the
+  // peer actually received + applied the full state (and retransmit if not).
+  static const syncChunk = MessageType._(0x32);
+  static const syncAck = MessageType._(0x33);
+
   // Noise encryption (we skip Noise, but must recognise the types)
   static const noiseHandshake = MessageType._(0x10);
   static const noiseEncrypted = MessageType._(0x11);
@@ -66,5 +76,7 @@ class MessageType {
     nostrCarrier,
     voiceFrame,
     personal,
+    syncChunk,
+    syncAck,
   ];
 }
