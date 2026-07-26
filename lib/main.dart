@@ -96,6 +96,7 @@ class _ResQShellState extends State<ResQShell> {
   late final BatteryService _battery;
   late final LocationService _location;
   late final DeviceSensorService _deviceSensors;
+  StreamSubscription<IncomingSos>? _sosSubscription;
 
   @override
   void initState() {
@@ -115,10 +116,47 @@ class _ResQShellState extends State<ResQShell> {
     unawaited(_battery.init());
     unawaited(_location.init());
     unawaited(_deviceSensors.init());
+    _sosSubscription = _mesh.sosStream.listen((sos) {
+      if (!mounted) return;
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          icon: const Icon(Icons.sos_rounded, color: Color(0xFFC33D30), size: 42),
+          title: const Text('Emergency SOS received'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('From: ${sos.senderName}'),
+              const SizedBox(height: 4),
+              Text(
+                'Time: ${DateTime.fromMillisecondsSinceEpoch(sos.timestamp)}',
+              ),
+              if (sos.latitude != null && sos.longitude != null) ...[
+                const SizedBox(height: 8),
+                Text('Latitude: ${sos.latitude!.toStringAsFixed(6)}'),
+                Text('Longitude: ${sos.longitude!.toStringAsFixed(6)}'),
+              ],
+              if (sos.accuracy != null) ...[
+                const SizedBox(height: 4),
+                Text('Accuracy: +/- ${sos.accuracy!.toStringAsFixed(1)}m'),
+              ],
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+    });
   }
 
   @override
   void dispose() {
+    _sosSubscription?.cancel();
     _mesh.dispose();
     _battery.dispose();
     _location.dispose();
@@ -161,19 +199,178 @@ class _ResQShellState extends State<ResQShell> {
             ),
             onPressed: () async {
               Navigator.pop(dialogContext);
-              final sent = await _mesh.sendSos();
+              final pos = _location.position;
+              final sent = await _mesh.sendSos(
+                latitude: pos?.latitude,
+                longitude: pos?.longitude,
+                accuracy: pos?.accuracy,
+              );
               if (!mounted) return;
-              if (!sent) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text(
-                      'Start the mesh first in the People tab before sending an SOS.',
-                    ),
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    sent
+                        ? 'SOS sent to nearby devices'
+                        : 'Start the mesh first in the People tab before sending an SOS.',
                   ),
-                );
-              }
+                ),
+              );
             },
             child: const Text('Hold to send'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _openShareLocation() {
+    if (_mesh.state != MeshState.running) {
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Mesh not active'),
+          content: const Text('Start the mesh in the People tab first.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    final allPeers = _mesh.currentPeers;
+    final connectedPeers = allPeers.where((p) => p.connected).toList();
+    debugPrint('[share-location] currentPeers=${allPeers.length} connected=${connectedPeers.length}');
+    for (final p in allPeers) {
+      debugPrint(
+        '[share-location] peer id=${p.id} name=${p.nickname} '
+        'connected=${p.connected} identityHint=${p.identityHint}',
+      );
+    }
+
+    // Build the set of reachable peers using the same source the chat screen
+    // uses: PersonalContact objects (always carry a valid hex sender ID).
+    //
+    // Strategy (three sources, each stricter than the last):
+    //   1. Direct match — BLE peers whose identityHint is already bound.
+    //   2. Connected contacts — contacts with an established chat link.
+    //   3. Fallback — any verified contact when BLE is connected but
+    //      _bindRawPeerToIdentity failed to set identityHint on the inbound
+    //      BLE peer (e.g. duplicate BLE UUIDs from connect + subscribe).
+    final reachable = <String, String>{}; // senderId -> displayName
+    int skippedNoIdentity = 0;
+
+    // Source 1: direct identityHint match
+    for (final peer in connectedPeers) {
+      if (peer.identityHint != null) {
+        reachable[peer.identityHint!] = peer.nickname;
+        debugPrint('[share-location] source=identityHint id=${peer.identityHint} name=${peer.nickname}');
+      } else {
+        skippedNoIdentity++;
+        debugPrint('[share-location] skip (no identityHint) id=${peer.id}');
+      }
+    }
+
+    // Source 2: contacts with an active chat link
+    for (final contact in _mesh.contacts) {
+      if (contact.linkUp || contact.status == ConnectionStatus.connected) {
+        reachable[contact.id] = contact.name;
+        debugPrint('[share-location] source=contact id=${contact.id} name=${contact.name} status=${contact.status} linkUp=${contact.linkUp}');
+      }
+    }
+
+    // Source 3: verified contacts when BLE connected but identityHint is missing
+    if (connectedPeers.isNotEmpty && skippedNoIdentity > 0) {
+      for (final contact in _mesh.contacts) {
+        if (contact.signingKey != null && !reachable.containsKey(contact.id)) {
+          reachable[contact.id] = contact.name;
+          debugPrint('[share-location] source=fallback id=${contact.id} name=${contact.name}');
+        }
+      }
+    }
+
+    debugPrint('[share-location] reachable=${reachable.length}');
+
+    if (reachable.isEmpty) {
+      showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('No connected devices'),
+          content: const Text(
+            "You're currently not connected to any nearby ResQ users.",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Share location with…'),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: reachable.length,
+            itemBuilder: (context, index) {
+              final entry = reachable.entries.elementAt(index);
+              final displayName = entry.value;
+              final shortId = entry.key.length > 8
+                  ? entry.key.substring(0, 8)
+                  : entry.key;
+              return ListTile(
+                leading: const Icon(Icons.phone_android_rounded),
+                title: Text(displayName),
+                subtitle: Text(
+                  'ID: $shortId • Connected',
+                ),
+                onTap: () async {
+                  Navigator.pop(ctx);
+                  final pos = _location.position;
+                  if (pos == null) {
+                    if (!mounted) return;
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(
+                        content: Text('No GPS position available'),
+                      ),
+                    );
+                    return;
+                  }
+                  final sent = await _mesh.sendLocation(
+                    recipientId: entry.key,
+                    latitude: pos.latitude,
+                    longitude: pos.longitude,
+                    accuracy: pos.accuracy,
+                  );
+                  if (!mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        sent
+                            ? 'Location shared with $displayName'
+                            : 'Failed to share location',
+                      ),
+                    ),
+                  );
+                },
+              );
+            },
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
           ),
         ],
       ),
@@ -188,7 +385,7 @@ class _ResQShellState extends State<ResQShell> {
         battery: _battery,
         location: _location,
         onAssistant: () => setState(() => _selectedIndex = 1),
-        onPeople: () => setState(() => _selectedIndex = 2),
+        onShareLocation: _openShareLocation,
         onLibrary: () => setState(() => _selectedIndex = 3),
         onSensors: _openSensors,
         onSos: _openSos,
@@ -237,7 +434,7 @@ class HomeScreen extends StatelessWidget {
     required this.battery,
     required this.location,
     required this.onAssistant,
-    required this.onPeople,
+    required this.onShareLocation,
     required this.onLibrary,
     required this.onSensors,
     required this.onSos,
@@ -248,7 +445,7 @@ class HomeScreen extends StatelessWidget {
   final BatteryService battery;
   final LocationService location;
   final VoidCallback onAssistant;
-  final VoidCallback onPeople;
+  final VoidCallback onShareLocation;
   final VoidCallback onLibrary;
   final VoidCallback onSensors;
   final VoidCallback onSos;
@@ -451,7 +648,7 @@ class HomeScreen extends StatelessWidget {
                           subtitle: subtitle,
                           icon: Icons.my_location_rounded,
                           color: const Color(0xFF1C6B83),
-                          onTap: onPeople,
+                          onTap: onShareLocation,
                         );
                       },
                     ),

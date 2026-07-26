@@ -59,6 +59,49 @@ class _PersonalChatScreenState extends State<PersonalChatScreen> {
     }
   }
 
+  void _showMessageDetail(BuildContext context, PersonalMessage message) {
+    final data = message.data;
+    if (data == null) return;
+    final type = data['type'] as String?;
+    final lat = data['latitude'] as double?;
+    final lng = data['longitude'] as double?;
+    final acc = data['accuracy'] as double?;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        icon: Icon(
+          type == 'sos' ? Icons.sos_rounded : Icons.location_on_rounded,
+          color: type == 'sos'
+              ? const Color(0xFFC33D30)
+              : const Color(0xFF1C6B83),
+          size: 38,
+        ),
+        title: Text(
+          type == 'sos' ? 'Emergency SOS' : 'Shared Location',
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (lat != null) Text('Latitude: ${lat.toStringAsFixed(6)}'),
+            if (lng != null) Text('Longitude: ${lng.toStringAsFixed(6)}'),
+            if (acc != null && acc > 0)
+              Text('Accuracy: +/- ${acc.toStringAsFixed(1)}m'),
+            Text(
+              'Time: ${message.timestamp}',
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final connected = widget.contact.status == ConnectionStatus.connected;
@@ -90,26 +133,43 @@ class _PersonalChatScreenState extends State<PersonalChatScreen> {
                     itemCount: messages.length,
                     itemBuilder: (context, index) {
                       final message = messages[index];
+                      final isLocation = message.data?['type'] == 'location';
+                      final isSos = message.data?['type'] == 'sos';
                       return Align(
                         alignment: message.isMine
                             ? Alignment.centerRight
                             : Alignment.centerLeft,
-                        child: Container(
-                          margin: const EdgeInsets.only(bottom: 8),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 14,
-                            vertical: 10,
-                          ),
-                          decoration: BoxDecoration(
-                            color: message.isMine
-                                ? const Color(0xFF2A5D4A)
-                                : Colors.white,
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          child: Text(
-                            message.text,
-                            style: TextStyle(
-                              color: message.isMine ? Colors.white : null,
+                        child: GestureDetector(
+                          onTap: (isLocation || isSos)
+                              ? () => _showMessageDetail(context, message)
+                              : null,
+                          child: Container(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 10,
+                            ),
+                            decoration: BoxDecoration(
+                              color: isSos
+                                  ? const Color(0xFFC33D30)
+                                  : message.isMine
+                                      ? const Color(0xFF2A5D4A)
+                                      : Colors.white,
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                            child: Text(
+                              message.text,
+                              style: TextStyle(
+                                color: isSos
+                                    ? Colors.white
+                                    : message.isMine
+                                        ? Colors.white
+                                        : null,
+                                fontWeight:
+                                    (isLocation || isSos)
+                                        ? FontWeight.w700
+                                        : null,
+                              ),
                             ),
                           ),
                         ),

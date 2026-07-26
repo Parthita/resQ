@@ -92,6 +92,7 @@ class MeshController {
   final _contactsController =
       StreamController<List<PersonalContact>>.broadcast();
   final _messagesController = StreamController<PersonalMessage>.broadcast();
+  final _sosController = StreamController<IncomingSos>.broadcast();
   StreamSubscription<LinkPeer>? _peerSubscription;
   StreamSubscription<BitchatPacket>? _packetSubscription;
   StreamSubscription<void>? _docSubscription;
@@ -109,6 +110,7 @@ class MeshController {
   Stream<List<PersonalContact>> get contactsStream =>
       _contactsController.stream;
   Stream<PersonalMessage> get messagesStream => _messagesController.stream;
+  Stream<IncomingSos> get sosStream => _sosController.stream;
   List<PersonalMessage> messagesFor(String contactId) =>
       List.unmodifiable(_messages[contactId] ?? const []);
 
@@ -599,6 +601,58 @@ class MeshController {
           (_messages[sender] ??= []).add(message);
           _messagesController.add(message);
           break;
+        case 'location':
+          if (!contact.canChat) return;
+          final locLat = body['latitude'] as num?;
+          final locLng = body['longitude'] as num?;
+          final locAcc = body['accuracy'] as num?;
+          if (locLat == null || locLng == null) return;
+          if (!_seenPersonalCrdtIds.add('$sender:${packet.timestamp}')) break;
+          final locMessage = PersonalMessage(
+            contactId: sender,
+            text: '${contact.name} shared their location.',
+            timestamp: DateTime.fromMillisecondsSinceEpoch(packet.timestamp),
+            isMine: false,
+            data: {
+              'type': 'location',
+              'latitude': locLat.toDouble(),
+              'longitude': locLng.toDouble(),
+              'accuracy': locAcc?.toDouble(),
+            },
+          );
+          (_messages[sender] ??= []).add(locMessage);
+          _messagesController.add(locMessage);
+          break;
+        case 'sos':
+          final sosLat = body['lat'] as num?;
+          final sosLng = body['lon'] as num?;
+          final sosAcc = body['accuracy'] as num?;
+          final sosName = body['name'] as String? ?? sender;
+          if (!_seenPersonalCrdtIds.add('$sender:${packet.timestamp}')) break;
+          final sosMessage = PersonalMessage(
+            contactId: sender,
+            text: '🚨 SOS from $sosName',
+            timestamp: DateTime.fromMillisecondsSinceEpoch(packet.timestamp),
+            isMine: false,
+            data: {
+              'type': 'sos',
+              'latitude': sosLat?.toDouble(),
+              'longitude': sosLng?.toDouble(),
+              'accuracy': sosAcc?.toDouble(),
+              'senderName': sosName,
+            },
+          );
+          (_messages[sender] ??= []).add(sosMessage);
+          _messagesController.add(sosMessage);
+          _sosController.add(IncomingSos(
+            senderId: sender,
+            senderName: sosName,
+            timestamp: packet.timestamp,
+            latitude: sosLat?.toDouble(),
+            longitude: sosLng?.toDouble(),
+            accuracy: sosAcc?.toDouble(),
+          ));
+          break;
       }
       _emitContacts();
     } on Object catch (error) {
@@ -658,19 +712,23 @@ class MeshController {
   /// Broadcast an SOS alert over the mesh.
   ///
   /// Uses the existing personal-message envelope with `kind: 'sos'` so every
-  /// resQ peer receives it.  If [latitude] and [longitude] are available they
+  /// resQ peer receives it. If [latitude] and [longitude] are available they
   /// are included; otherwise the SOS is sent without coordinates.
   /// Returns `true` when the packet was handed to the router, `false` if the
   /// mesh has not been started yet.
-  Future<bool> sendSos({double? latitude, double? longitude}) async {
+  Future<bool> sendSos({double? latitude, double? longitude, double? accuracy}) async {
     if (!isStarted) return false;
     final body = <String, dynamic>{
       'kind': 'sos',
       'timestamp': DateTime.now().millisecondsSinceEpoch,
+      'name': displayName,
     };
     if (latitude != null && longitude != null) {
       body['lat'] = latitude;
       body['lon'] = longitude;
+    }
+    if (accuracy != null) {
+      body['accuracy'] = accuracy;
     }
     final packet = BitchatPacket(
       type: MessageType.personal.value,
@@ -682,6 +740,40 @@ class MeshController {
     await router.broadcast(await identity.signPacket(packet));
     return true;
   }
+
+  /// Send a one-time location share to a specific peer.
+  ///
+  /// Uses a personal-message envelope with `kind: 'location'` containing
+  /// latitude, longitude, accuracy, and timestamp.
+  /// Returns `true` when the packet was handed to the router, `false` if the
+  /// mesh has not been started yet or the recipient ID is invalid.
+  Future<bool> sendLocation({
+    required String recipientId,
+    required double latitude,
+    required double longitude,
+    required double accuracy,
+  }) async {
+    if (!isStarted) return false;
+    if (recipientId.isEmpty || recipientId.length.isOdd) return false;
+    // Validate that recipientId is a valid hex string (no dashes or other
+    // non-hex characters), matching the format used by [PersonalContact.id].
+    for (var i = 0; i < recipientId.length; i++) {
+      if (!_hexDigit(recipientId.codeUnitAt(i))) return false;
+    }
+    final body = <String, dynamic>{
+      'kind': 'location',
+      'latitude': latitude,
+      'longitude': longitude,
+      'accuracy': accuracy,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    };
+    await _sendEnvelope(body, recipient: recipientId);
+    return true;
+  }
+
+  static bool _hexDigit(int codeUnit) =>
+      (codeUnit >= 0x30 && codeUnit <= 0x39) ||
+      (codeUnit >= 0x61 && codeUnit <= 0x66);
 
   void _setState(MeshState s) {
     _state = s;
@@ -734,6 +826,7 @@ class MeshController {
     await _peerController.close();
     await _contactsController.close();
     await _messagesController.close();
+    await _sosController.close();
   }
 }
 
@@ -788,11 +881,30 @@ class PersonalMessage {
     required this.text,
     required this.timestamp,
     required this.isMine,
+    this.data,
   });
   final String contactId;
   final String text;
   final DateTime timestamp;
   final bool isMine;
+  final Map<String, dynamic>? data;
+}
+
+class IncomingSos {
+  IncomingSos({
+    required this.senderId,
+    required this.senderName,
+    required this.timestamp,
+    this.latitude,
+    this.longitude,
+    this.accuracy,
+  });
+  final String senderId;
+  final String senderName;
+  final int timestamp;
+  final double? latitude;
+  final double? longitude;
+  final double? accuracy;
 }
 
 /// Result of the runtime permission + adapter check.
