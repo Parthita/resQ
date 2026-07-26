@@ -272,17 +272,16 @@ class MeshController {
         try {
           if (contact.status == ConnectionStatus.outgoingPending) {
             debugPrint('[resq:mesh] replay pending request to=${contact.id}');
-            await _sendEnvelope({
-              'kind': 'request',
-              'name': 'resQ',
-            }, recipient: contact.id);
+            await _sendEnvelope(
+              {'kind': 'request', 'name': 'resQ'},
+              recipient: contact.id,
+            ).timeout(const Duration(seconds: 12));
           } else if (contact.accepted) {
             debugPrint('[resq:mesh] replay accepted response to=${contact.id}');
-            await _sendEnvelope({
-              'kind': 'response',
-              'accepted': true,
-              'name': 'resQ',
-            }, recipient: contact.id);
+            await _sendEnvelope(
+              {'kind': 'response', 'accepted': true, 'name': 'resQ'},
+              recipient: contact.id,
+            ).timeout(const Duration(seconds: 12));
           }
         } on Object catch (error, stackTrace) {
           debugPrint(
@@ -292,6 +291,7 @@ class MeshController {
       }
     } finally {
       _replayingRequests = false;
+      debugPrint('[resq:mesh] request replay guard cleared');
     }
   }
 
@@ -303,12 +303,19 @@ class MeshController {
     _resyncingDoc = true;
     try {
       debugPrint('[resq:mesh] CRDT resync start (full Yjs update)');
-      await tunnel.broadcastUpdate();
+      // Bound the send so a link that dies mid-resync (adapter power-off,
+      // peer out of range) cannot leave the underlying write hanging and this
+      // future never settling — which would wedge the guard for the rest of
+      // the session. The finally below still runs on timeout, clearing it.
+      await tunnel.broadcastUpdate().timeout(const Duration(seconds: 12));
       debugPrint('[resq:mesh] CRDT resync complete');
+    } on TimeoutException {
+      debugPrint('[resq:mesh] CRDT resync timed out (link likely gone)');
     } on Object catch (error, stackTrace) {
       debugPrint('[resq:mesh] CRDT resync failed: $error\n$stackTrace');
     } finally {
       _resyncingDoc = false;
+      debugPrint('[resq:mesh] CRDT resync guard cleared');
     }
   }
 
