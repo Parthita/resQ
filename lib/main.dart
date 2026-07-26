@@ -1190,6 +1190,11 @@ class _PeopleScreenState extends State<PeopleScreen> {
   bool _btOff = false;
   List<MeshPeer> _peerList = const [];
 
+  final Map<String, DateTime> _pendingSince = {};
+  final Set<String> _locallyCancelled = {};
+  final Set<String> _successBanner = {};
+  Timer? _pendingTimer;
+
   /// Collapse raw MeshPeers that share a verified resQ senderId
   /// (identityHint) into a single row. Prefer the connected, named entry.
   List<MeshPeer> _coalescePeers(List<MeshPeer> peers) {
@@ -1233,6 +1238,25 @@ class _PeopleScreenState extends State<PeopleScreen> {
     widget.mesh.peersStream.listen((peers) {
       if (mounted) setState(() => _peerList = peers);
     });
+    widget.mesh.contactsStream.listen((contacts) {
+      if (!mounted) return;
+      for (final c in contacts) {
+        if (c.status == ConnectionStatus.connected) {
+          if (_pendingSince.remove(c.id) != null) {
+            _successBanner.add(c.id);
+            Future.delayed(const Duration(seconds: 3), () {
+              if (mounted) setState(() => _successBanner.remove(c.id));
+            });
+          }
+        }
+        if (c.status != ConnectionStatus.outgoingPending) {
+          if (_pendingSince.remove(c.id) != null) {
+            // Transitioned out of pending (rejected/disconnected/etc.)
+          }
+        }
+      }
+      _stopPendingTimerIfEmpty();
+    });
   }
 
   Future<void> _toggleMesh() async {
@@ -1275,6 +1299,7 @@ class _PeopleScreenState extends State<PeopleScreen> {
       case ConnectionStatus.available:
       case ConnectionStatus.rejected:
       case ConnectionStatus.disconnected:
+        _recordPending(contact.id);
         await widget.mesh.requestConnection(contact);
         return;
       case ConnectionStatus.incomingPending:
@@ -1352,6 +1377,52 @@ class _PeopleScreenState extends State<PeopleScreen> {
     widget.mesh.nickname = trimmed.isEmpty ? null : trimmed;
     await NicknameStore.save(trimmed.isEmpty ? null : trimmed);
     if (mounted) setState(() {});
+  }
+
+  void _recordPending(String contactId) {
+    _pendingSince.putIfAbsent(contactId, () => DateTime.now());
+    _locallyCancelled.remove(contactId);
+    _startPendingTimer();
+  }
+
+  void _cancelRequest(String contactId) {
+    _locallyCancelled.add(contactId);
+    _pendingSince.remove(contactId);
+    if (mounted) setState(() {});
+    _stopPendingTimerIfEmpty();
+  }
+
+  void _startPendingTimer() {
+    if (_pendingTimer != null) return;
+    _pendingTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) {
+        if (mounted && _pendingSince.isNotEmpty) setState(() {});
+      },
+    );
+  }
+
+  void _stopPendingTimerIfEmpty() {
+    if (_pendingSince.isEmpty && _pendingTimer != null) {
+      _pendingTimer?.cancel();
+      _pendingTimer = null;
+    }
+  }
+
+  String _pendingStage(PersonalContact contact) {
+    final since = _pendingSince[contact.id];
+    if (since == null) return 'Request sent…';
+    final elapsed = DateTime.now().difference(since).inSeconds;
+    if (elapsed < 1) return '✓ Request sent';
+    if (elapsed < 10) return 'Waiting for the other person to accept…';
+    if (elapsed < 30) return 'Still waiting… Make sure the other device is open.';
+    return 'No response yet.';
+  }
+
+  @override
+  void dispose() {
+    _pendingTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -1494,14 +1565,19 @@ class _PeopleScreenState extends State<PeopleScreen> {
                     ...contacts.map(
                       (contact) => Padding(
                         padding: const EdgeInsets.only(bottom: 10),
-                        child: NearbyDevice(
-                          name: contact.name,
-                          detail: _contactDetail(contact.status),
+                        child: ContactCard(
+                          contact: contact,
+                          mesh: widget.mesh,
+                          pendingSince: _pendingSince[contact.id],
+                          pendingStage: _pendingStage(contact),
+                          detail: _contactDetail(
+                            contact.status,
+                            isCancelled: _locallyCancelled.contains(contact.id),
+                          ),
+                          isLocallyCancelled: _locallyCancelled.contains(contact.id),
+                          showSuccessBanner: _successBanner.contains(contact.id),
                           onConnect: () => _handleContact(contact),
-                          actionLabel:
-                              contact.status == ConnectionStatus.connected
-                              ? 'Chat'
-                              : 'Connect',
+                          onCancel: () => _cancelRequest(contact.id),
                         ),
                       ),
                     ),
@@ -1533,14 +1609,17 @@ class _PeopleScreenState extends State<PeopleScreen> {
     );
   }
 
-  String _contactDetail(ConnectionStatus status) => switch (status) {
-    ConnectionStatus.available => 'Nearby • tap to request connection',
-    ConnectionStatus.outgoingPending => 'Request sent • waiting for acceptance',
-    ConnectionStatus.incomingPending => 'Connection request waiting',
-    ConnectionStatus.connected => 'Connected • private chat ready',
-    ConnectionStatus.rejected => 'Request declined • tap to request again',
-    ConnectionStatus.disconnected => 'Bluetooth disconnected',
-  };
+  String _contactDetail(ConnectionStatus status, {bool isCancelled = false}) {
+    if (isCancelled) return 'Available nearby';
+    return switch (status) {
+      ConnectionStatus.available => 'Available nearby',
+      ConnectionStatus.outgoingPending => '',
+      ConnectionStatus.incomingPending => 'Wants to connect',
+      ConnectionStatus.connected => 'Connected — tap to start chatting',
+      ConnectionStatus.rejected => 'Connection request declined',
+      ConnectionStatus.disconnected => 'Connection lost — move closer to reconnect',
+    };
+  }
 }
 
 class LibraryScreen extends StatefulWidget {
@@ -2224,6 +2303,264 @@ class SensorMetric extends StatelessWidget {
       ),
     ),
   );
+}
+
+class ContactCard extends StatelessWidget {
+  const ContactCard({
+    required this.contact,
+    required this.mesh,
+    required this.pendingSince,
+    required this.pendingStage,
+    required this.detail,
+    required this.isLocallyCancelled,
+    required this.showSuccessBanner,
+    required this.onConnect,
+    required this.onCancel,
+    super.key,
+  });
+
+  final PersonalContact contact;
+  final MeshController mesh;
+  final DateTime? pendingSince;
+  final String pendingStage;
+  final String detail;
+  final bool isLocallyCancelled;
+  final bool showSuccessBanner;
+  final VoidCallback onConnect;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    final status = contact.status;
+    final isPending = status == ConnectionStatus.outgoingPending && pendingSince != null;
+    final isConnected = status == ConnectionStatus.connected;
+    final isIncoming = status == ConnectionStatus.incomingPending;
+
+    final Widget trailing;
+
+    if (isConnected) {
+      trailing = TextButton(
+        onPressed: onConnect,
+        child: const Text('Chat'),
+      );
+    } else if (isPending) {
+      trailing = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+          const SizedBox(width: 8),
+          Text(
+            'Waiting…',
+            style: TextStyle(
+              color: Theme.of(context).colorScheme.primary,
+              fontWeight: FontWeight.w600,
+              fontSize: 13,
+            ),
+          ),
+        ],
+      );
+    } else if (isLocallyCancelled) {
+      trailing = TextButton(
+        onPressed: onConnect,
+        child: const Text('Connect'),
+      );
+    } else if (isIncoming) {
+      trailing = TextButton(
+        onPressed: onConnect,
+        child: const Text('Connect'),
+      );
+    } else {
+      trailing = TextButton(
+        onPressed: onConnect,
+        child: Text(
+          status == ConnectionStatus.rejected || status == ConnectionStatus.disconnected
+              ? 'Connect'
+              : 'Connect',
+        ),
+      );
+    }
+
+    final cardColor = isPending
+        ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.4)
+        : showSuccessBanner
+            ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.3)
+            : null;
+
+    final elapsed = pendingSince != null
+        ? DateTime.now().difference(pendingSince!).inSeconds
+        : 0;
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOut,
+      child: Card(
+        color: cardColor,
+        child: AnimatedSize(
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
+                leading: Container(
+                  width: 42,
+                  height: 42,
+                  decoration: BoxDecoration(
+                    color: isPending
+                        ? Theme.of(context).colorScheme.primaryContainer
+                        : isConnected
+                            ? const Color(0xFFE2F0E4)
+                            : const Color(0xFFE8E7E0),
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  child: Icon(
+                    isConnected
+                        ? Icons.check_circle_rounded
+                        : isPending
+                            ? Icons.hourglass_top_rounded
+                            : Icons.phone_android_rounded,
+                    color: isPending
+                        ? Theme.of(context).colorScheme.onPrimaryContainer
+                        : isConnected
+                            ? const Color(0xFF2A5D4A)
+                            : const Color(0xFF68736D),
+                  ),
+                ),
+                title: Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        contact.name,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontWeight: isPending ? FontWeight.w800 : FontWeight.w700,
+                        ),
+                      ),
+                    ),
+                    if (isPending) ...[
+                      const SizedBox(width: 6),
+                      Text(
+                        '$elapsed s',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.4),
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                subtitle: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 250),
+                  child: isPending
+                      ? Text(
+                          pendingStage,
+                          key: const ValueKey('pending'),
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.6),
+                          ),
+                        )
+                      : Text(
+                          detail,
+                          key: ValueKey('detail_${contact.status.name}'),
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: isConnected
+                                ? Theme.of(context).colorScheme.primary
+                                : Theme.of(context).colorScheme.onSurface.withValues(alpha: 0.5),
+                          ),
+                        ),
+                ),
+                trailing: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 250),
+                  transitionBuilder: (child, animation) {
+                    return FadeTransition(
+                      opacity: animation,
+                      child: child,
+                    );
+                  },
+                  child: SizedBox(
+                    key: ValueKey('trailing_${contact.status.name}_$isLocallyCancelled'),
+                    child: trailing,
+                  ),
+                ),
+                onTap: isConnected || isIncoming ? onConnect : null,
+              ),
+              if (isPending)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+                  child: Row(
+                    children: [
+                      TextButton.icon(
+                        onPressed: onCancel,
+                        icon: const Icon(Icons.close_rounded, size: 16),
+                        label: const Text('Cancel Request'),
+                        style: TextButton.styleFrom(
+                          foregroundColor: Theme.of(context).colorScheme.error,
+                          textStyle: const TextStyle(fontSize: 12),
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                      const Spacer(),
+                      TextButton.icon(
+                        onPressed: onConnect,
+                        icon: const Icon(Icons.refresh_rounded, size: 16),
+                        label: const Text('Send Again'),
+                        style: TextButton.styleFrom(
+                          textStyle: const TextStyle(fontSize: 12),
+                          padding: const EdgeInsets.symmetric(horizontal: 10),
+                          minimumSize: Size.zero,
+                          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              if (showSuccessBanner)
+                AnimatedOpacity(
+                  duration: const Duration(milliseconds: 400),
+                  opacity: showSuccessBanner ? 1.0 : 0.0,
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.check_circle_rounded,
+                          size: 16,
+                          color: Theme.of(context).colorScheme.primary,
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          'Secure connection established',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                            color: Theme.of(context).colorScheme.primary,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 class _ChatMessage {
